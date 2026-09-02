@@ -145,14 +145,10 @@ For a turtle entering the calculation at a given size, the expected contribution
 - remigration interval;
 - mortality associated with the threat.
 
-The probability of first nesting in year \(j\) is represented as:
+The probability of first nesting in year j is represented as:
 
 ```math
-p(FN_j)
-=
-p(M_j)
-\prod_{h<j}
-\left[1-p(M_h)\right]
+p(FN_j) = p(M_j)\prod_{h \lt j}\left[1-p(M_h)\right]
 ```
 
 This assigns each turtle to its expected first nesting event only once.
@@ -166,18 +162,18 @@ The resulting threat contribution is standardized to annual nesting females.
 The retained Martin/Siders projection structure is:
 
 ```math
-N_{t+1}
-=
-\max\left[
-0,\;
-\max(0,N_t-T_t)e^{U_t}
-+
-\sqrt{Q_t}z_t
-+
-G_t
-\right]
+N_{t+1} = \max\left(0,\; \max(0,N_t-T_t)e^{U_t} + \sqrt{Q_t}z_t + G_t\right)
 ```
 
+where:
+
+- `N_t` is annual nesting-female abundance;
+- `T_t` is threat-related ANE loss;
+- `U_t` is instantaneous population trend;
+- `Q_t` is process variance;
+- `z_t` is a standard-Normal process innovation;
+- `G_t` is conservation-related ANE gain.
+  
 where:
 
 - \(N_t\) is annual nesting-female abundance;
