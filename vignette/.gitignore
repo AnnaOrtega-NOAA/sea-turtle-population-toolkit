@@ -1,0 +1,7 @@
+.quarto/
+_site/
+node_modules/
+.openai/source-credentials*
+
+/.quarto/
+**/*.quarto_ipynb

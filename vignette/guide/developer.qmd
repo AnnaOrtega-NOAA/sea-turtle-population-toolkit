@@ -1,0 +1,162 @@
+---
+title: "Methods & validation"
+page-layout: full
+---
+
+::: {.science .methods}
+
+::: {.eyebrow}
+Scientific provenance · equations · implementation
+:::
+
+# Follow the calculation all the way down.
+
+This vignette describes the framework presented by Ortega et al. (2026), building on methods developed by Martin et al. (2020a, 2020b) and Siders et al. (2023, 2025). Extensions are distinguished from retained components. Both the vignette and the methods remain under active development and are not yet finalized.
+
+## The scientific contract
+
+Annual nesters are the state variable. Annual nests are divided by clutch frequency before fitting. Each impact becomes expected annual-nester contribution, allocated through a first-nesting schedule. Give begins with an explicit counterfactual increment. Scenario projections share their random future.
+
+The site’s numeric size and conservation examples use the paper’s composite leatherback parameter set. Its matched-future demonstration uses clearly labeled **synthetic posterior-like rows**, not a population fit. Monitoring pattern/ribbon illustrations are schematic; reported stress-test figures are attributed to Methods §3.1.
+
+## Equation order and symbols
+
+| Equation | Scientific operation | R names / distinction |
+|---|---|---|
+| 1–2 | Latent monthly log counts + Fourier seasonal increment + observation error | Monthly imputation states are not annual trend states. |
+| 3 | $N_{obs,j,k}=Nests_{j,k}/CF$ | Annual nesting females, not all adult females. |
+| 4 | $T_j=T_{j-1}+r+\omega_j$, $\omega_j\sim N(0,Q)$ | Paper T → app X; paper r → app U; Q is variance. |
+| 5 | $\log N_{obs,j,k}=T_j+a_k+v_{j,k}$, $v_{j,k}\sim N(0,R_k)$ | App A is a fixed site offset; R is observation variance. |
+| 6 | $N_{final}=\sum_k\exp(T_{final}+a_k)$, $a_1=0$ | App N_fym0 starts projection, with same-row U/Q. |
+| 7 | $L(A)=L_\infty[1-\exp\{-k(A-t_0)\}]$ | von Bertalanffy growth and inverse age. |
+| 8 | Logistic length-to-first-nesting transition; forced at $0.99L_\infty$ | `maturity_probability`; biological interpretation is first nesting. |
+| 9 | $p(FN_{i,j})=p(T_{i,j})\prod_{h<j}[1-p(T_{i,h})]$ | First-event allocation, once only. |
+| 10–11 | $\phi_{i,j}=(1-p(T_{i,j}))\phi_{juv}+p(T_{i,j})\phi_{adult}$; $S_{i,j}=\prod_{h=1}^j\phi_{i,h}$ | Probability-weighted survival before first-event allocation. |
+| 12–14 | $ANE^T_{i,j}=S_{i,j}p(FN_{i,j})p(F)D_i/RI$; sum over turtles | Adult identity: $\phi_{adult}p(F)D_i/RI$. |
+| 15 | $\Delta n_a=E(n_a\mid I=1)-E(n_a\mid I=0)$ | Incremental benefit; not total treated/released. |
+| 16–18 | $ANE^G_{a,j}=\Delta n_aS_{a,j}p(FN_{a,j})p(F)/RI$ | Entry-specific survival/census timing; adult and emergence identities. |
+| 19 | $N_j^- = \max(0,N_j-ANE^T_j)$ | Remove Take before growth. |
+| 20 | $N_{j+1}=N_j^-\exp(r_j)+\sqrt{Q_j}z_j$ | Historical abundance-scale process SD is **√Q**, not Q. |
+| 21–22 | $N_{j+1}=\max(0,N_{j+1}+ANE^G_j)$ | Add translated Give after transition; nonnegative safeguard. |
+
+The symbol T in the latent model and the superscript T for Take are different. The main interactive transition writes **Take** and **Give** explicitly to avoid conflating them. The paper and code use different names for the same shared annual trend (r/U).
+
+## Monitoring implementation {#monitoring-code}
+
+| Supplied app component | What to inspect |
+|---|---|
+| `run_fourier_imputation` | Retained monthly Fourier model, single- and multiple-site variants; seasonal period and latent/observation error. |
+| Annual preparation and conversion | Missing values, explicit observed-zero handling, season-year alignment, CF conversion and the annual summary passed downstream. |
+| `run_jags_aligned` | Shared latent X, U, Q, site-specific R and A; A[1] = 0. |
+| `regional_abundance_draws` | Exponentiate latent X + A and sum modeled sites within each posterior draw. |
+| `build_siders_projection_posterior` | Final annual nesters N_fym0 are the initial state. Retain joint row IDs, U, Q. |
+| `Total_Females` | RI/4 times the last four annual-nester states, a reporting quantity only. |
+
+::: {.callout}
+The supplied Gaussian log-count model requires positive observed counts. Observed zeroes are not missing observations. The app’s input check is a scientific boundary, not permission to replace zeroes with missing values or arbitrary offsets.
+:::
+
+Monthly imputation posterior uncertainty is retained for inspection, but summarized annual estimates enter the state-space fit. This is a sequential workflow, not a fully joint monthly-to-projection model. Observation variance in the annual model must not be described as proof that all upstream imputation uncertainty has been propagated.
+
+### What the monitoring stress test found
+
+| Degradation | Reported result in Methods §3.1 | Interpretation |
+|---|---|---|
+| Random missing months, up to 90% | Nest accuracy 97.6% → 95.6%; population accuracy >92% | Dispersed loss was comparatively well tolerated in this synthetic season. |
+| Monitoring every 10 years | Population-state accuracy 55.0%; nest accuracy about 91% at 9–10-year intervals | Long gaps weaken population-state recovery and reconstruction. |
+| Record ending in 2000 rather than 2025 | Trend 95% interval width 0.407 rather than 0.058; nest accuracy 97.6–98.4% | Short histories strongly weaken trend precision. |
+
+This experiment is an initial stress test, not a universal sampling-design guarantee. Some imputation R-hat values exceeded 1.10 at intervals of six years or longer. Terminal truncation changes the endpoint at which population recovery is evaluated; it is not a forecast of unobserved terminal years.
+
+## Demographic implementation
+
+| Supplied app function | Scientific role |
+|---|---|
+| `siders_demographic_path` | Inverse growth age, retained forced-age sequence, size-based transition, probability-weighted survival. |
+| `first_nesting_path` | Analytical first-event probability and cumulative survival. |
+| `fishery_ane_kernel` | Mortality-weighted expected Take; not a repeated first-nesting realization. |
+| `conservation_first_nesting_path` | Survival from interval-start age, first nesting at destination census, optional first-interval survival. |
+| Conservation cohort builder | Counterfactual emergence, release age, or adult deaths prevented; sum calendar-aligned cohorts. |
+
+Take and Give share the demographic ingredients but retain the implemented entry-to-census conventions. The Take sequence starts from observed size; Give evaluates first nesting at the annual census reached after each intervention interval. The adult identity includes survival through that first interval in both pathways.
+
+### Leatherback demonstration inputs
+
+| Parameter | Value | Meaning |
+|---|---:|---|
+| CF | 5.5 | Clutches per nesting female |
+| Eggs | 77.9 | Eggs per nest |
+| RI | 3.06 years | Remigration interval |
+| L∞ | 142.7 cm SCL | Asymptotic straight carapace length |
+| k | 0.2262 year⁻¹ | Growth coefficient |
+| t₀ | −0.17 years | Theoretical zero-length age |
+| L_mat | 139.1325 cm | Logistic location, 97.5% L∞ |
+| σ_mat | 6.3399 cm | Logistic scale |
+| p(F) | 0.73 | Probability female |
+| ϕ_juv / ϕ_adult | 0.81 / 0.893 | Annual survival |
+| Emerged-to-yearling survival | 0.0625 | First interval for nest-protection hatchlings |
+| Forced first-nesting threshold | 99% L∞ | Retained baseline convention |
+
+This composite parameter set draws on several leatherback populations and demonstrates a method; it is not a new assessment of any regional management unit. The 60-year horizon matches the analysis script. The app’s equal-to/above-L∞ forced-age boundary safeguard is an implementation extension outside the ordinary inverse-growth input domain.
+
+## Projection and uncertainty
+
+`project_population_step` preserves Take → exp(U) → √Q z → Give → nonnegative census. `draw_projection_uq` uses the selected initial row for the first transition and later samples rows without replacement while retaining U/Q pairing. Compared scenarios reuse the same row indices and z values.
+
+The inherited log-model/abundance-projection noise convention is exposed explicitly. Replacing additive √Q z with a multiplicative lognormal process would be a model change, not a website correction.
+
+Optional app uncertainty inputs extend the fixed-parameter Methods calculation. Zero SDs with fixed counts reproduce the expected-value baseline. No claim is made that these inputs form a jointly estimated demographic posterior or that conservation counterfactual uncertainty is automatically inferred.
+
+## Retained lineage and extensions
+
+| Retained Martin/Siders/Eguchi lineage | Methods-paper extensions |
+|---|---|
+| Monthly Fourier imputation | Analytical expected first-nesting probability |
+| Shared-trend annual-nester state-space model | Explicit counterfactual Give |
+| von Bertalanffy growth and size-dependent transition | Matched stochastic realizations across scenarios |
+| Probability-weighted survival, probability female, RI standardization | Nonnegative abundance safeguard |
+| Take before growth | Generalized comparison of threats and conservation |
+| Paired dynamic U/Q sampling | |
+| Historical abundance-scale √Q error convention | |
+
+## Validation: what is actually checked? {#validation}
+
+**Supplied app validation record: 25/25 built-in mathematical checks passed.** The app header reports those results from R 4.3.3, together with 565 external checks. This website redesign does not represent that record as a new R/JAGS run. The browser teaching kernels have a separate test suite and are checked against the paper’s reported size results and analytical identities.
+
+| Check | What passing establishes |
+|---|---|
+| Zero interactions → zero Take | No contribution can arise from an absent threat cohort. |
+| Zero mortality → zero Take | Mortality is applied exactly once as a probability weight. |
+| No counterfactual improvement → zero Give | Total treated animals do not receive automatic demographic credit. |
+| First-event mass sums to ≤1 | First nesting is allocated only once. |
+| Adult Take / Give analytical symmetry | Shared survival, sex, and RI standardization at the adult entry point. |
+| Take before growth | Loss is removed before exp(U), including the inner zero safeguard. |
+| Give after translation | Benefit is added at its destination census without a second growth step. |
+| Zero Take + Give reproduces status quo | Scenario mechanics do not introduce changes independently of actions. |
+| Final annual-nester posterior starts projection | RI/4 reporting is not used as the state initializer. |
+| U/Q row pairing | Dependence between trend and process variance is preserved. |
+| Shared stochastic realization | Compared scenarios differ by schedules, not random environments. |
+
+::: {.callout}
+**Implementation validation is not biological validation.** It tests arithmetic, timing, identities, and internal consistency. It does not establish the appropriateness of a population’s parameters, the credibility of its counterfactual, or model adequacy.
+:::
+
+<details><summary>Show developer diagnostics</summary>
+
+The supplied Shiny Developer view retains chains and exposes posterior/trace plots, R-hat, effective sample sizes, and Geweke diagnostics, plus imputation-fit and model records. MARSS is an additional diagnostic. Screening thresholds flag issues; they are not proof of convergence. Inspect site scaling, observation variance, and parameter sensitivity as well as chain behavior. Exact replay seeds are not yet retained in the supplied app; exported chains support inspection.
+
+</details>
+
+<details><summary>Planned dynamic demographic inputs</summary>
+
+Future input modes may include fixed estimates, annual values, uploaded series, linear/exponential/logistic/step change, and covariate relationships such as $\operatorname{logit}(\phi_t)=\alpha+\beta C_t$. These modes are **planned**, distinct from the current dynamic U/Q posterior sampler. A constant demographic schedule must reproduce the existing model exactly before nonconstant schedules are accepted.
+
+</details>
+
+## Reproduce this teaching site
+
+Use `quarto preview` to explore locally, `npm test` for the independent teaching-kernel checks, and `quarto render` for the complete static website. No R or JAGS fit runs inside the site. Use the Shiny toolkit for user-data fitting and scenario evaluation.
+
+[Return to the scientific map](../index.html) · [Walkthrough](../walkthrough.html) · [Toolkit repository](https://github.com/AnnaOrtega-NOAA/sea-turtle-population-toolkit)
+
+:::
