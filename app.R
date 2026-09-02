@@ -1,56 +1,30 @@
-# GUIDED + DEVELOPER INTERFACE — 2026-09-02
-# Based on the supplied methods-aligned engine and its tested guided workflow.
-# View toggle is presentation-only. No preview/mockup data is used as output.
-# Additions: true retained-chain diagnostics, imputation fit retention, model
-# records, consistent six-screen UI. The multisite Fourier extra brace is fixed.
-# Existing CSV contracts are preserved: sex remains a shared population input;
-# action Amount retains action-specific semantics. No new cohort schema is implied.
-# Diagnostic thresholds are screening conventions, not proof of convergence.
-# Exact replay seeds are not yet retained; exported chains support inspection.
-# =====================================================================
-# METHODS-ALIGNED APP -- guided UI revision 2026-09-02
-# Five-step workflow; embedded examples; saved scenarios compared with shared draws.
-# Population kernels and manuscript equations are unchanged from 2026-09-01.
-# Reference: Methods_ConsBio_20260831.pdf and
-#            MethodsScript_ConsBio_20260831(8).R (user supplied).
+# ==============================================================================
+# SEA TURTLE POPULATION TOOLKIT
+# ==============================================================================
 #
-# Equation map (paper symbols -> retained R names):
-#   7-8:  VBGF + first-nesting transition p(T) -> maturity_probability
-#   9:    p(FN)[j] = p(T)[j] * prod(1 - p(T)[h], h < j)
-#   10-11: phi = (1-p(T))*pj + p(T)*pa; S = cumprod(phi)
-#   12-14: Take = turtles * S * p(FN) * pf / ri * mortality
-#   15-18: Give = EXTRA cohort * survival to census * p(FN) * pf / ri
-#   19-22: N_next = max(0, max(0,N-Take)*exp(U) + sqrt(Q)*z + Give)
-# U is paper r (instantaneous trend); Q is a variance, not an SD.
-# The inherited additive abundance-scale use of sqrt(Q) is deliberately
-# retained, including the manuscript's stated log-model/projection convention.
+# A Shiny app for moving from nesting records to:
+#   • population trend and abundance estimates
+#   • threat scenarios
+#   • conservation scenarios
+#   • side-by-side population projections
 #
-# Projection state and initializer are ANNUAL NESTERS. RI/4 adult-female
-# summaries are reporting quantities only. Take precedes growth; Give follows
-# it. Neither first nesting nor sex/mortality is re-drawn as a Bernoulli event.
-# Optional count/size/mortality/demographic uncertainty is an app extension;
-# with fixed counts and zero SDs the result equals the manuscript calculation.
+# Start here:
+#   1. Open this file in RStudio
+#   2. Click "Run App"
+#   3. Use the built-in example, or upload your own nesting CSV
 #
-# Threat CSV: year,turtles,median_cm,mortality. One row per forecast year.
-# Year labels the destination census: 2027 means the transition 2026 -> 2027.
-# turtles = number affected, NOT deaths; mortality = total death probability
-# per interaction (0..1). Do not multiply the count by mortality in advance.
-# median_cm is the median length of that year's affected turtles, using the
-# same carapace measure as the VBGF. A median alone specifies a representative
-# cohort; optional log-length SD supplies a within-cohort size distribution.
-# With uncertainty, mortality is the logit-normal median (fixed if SD = 0).
-# Lognormal median = exp(mean log length), NOT the arithmetic mean length.
-# Zero turtles must be explicit; omitted years are not assumed to mean zero.
+# The default interface is designed for conservation practitioners.
+# Turn on "Developer view" for posterior diagnostics and model details.
 #
-# Changes beyond the paper's ordinary input domain are annotated locally:
-# length == Linf uses the existing over-Linf forced-age fallback;
-# probability draws are bounded; user input is validated rather than guessed.
-# The app's built-in mathematical checks can run after loading functions;
-# Validation: 565 external checks and 25 built-in checks passed in R 4.3.3.
-# Largest reference difference: 1.39e-17. Guided UI additionally tested with
-# real annual and monthly JAGS/MARSS fits, saved scenarios, and matched comparisons.
-# UI/JAGS fitting still requires the packages listed below and JAGS installed.
-# =====================================================================
+# Methods:
+#   The core trend, abundance, fishery ANE, and projection calculations retain
+#   the Martin/Siders method lineage. Conservation Give and selected uncertainty
+#   features are explicit extensions.
+#
+# Full mathematical lineage, validation, assumptions, and regression checks:
+#   see README.md and docs/VALIDATION.md
+#
+# ==============================================================================
 
 library(shiny)
 library(bslib)
