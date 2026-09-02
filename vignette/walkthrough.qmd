@@ -1,0 +1,13 @@
+---
+title: "Walkthrough"
+page-layout: full
+---
+
+```{=html}
+<div class="science walk"><div class="eyebrow">Walkthrough · about one minute</div><h1>One population. Two ways to understand it.</h1><p>Monitoring measures the nesting population. Threats and conservation affect turtles at many stages. This framework makes their consequences comparable.</p>
+<div class="pathways"><div class="lane"><div class="eyebrow">Observe</div><h3>What is the population doing?</h3><div class="node">Nesting observations</div><div class="arrow">↓</div><div class="node">Reconstruct missing months</div><div class="arrow">↓</div><div class="node">Annual nests ÷ clutch frequency</div><p>Estimate annual-nester abundance, trend, and uncertainty.</p></div><div class="lane impact"><div class="eyebrow">Translate</div><h3>What contribution is lost or added?</h3><div class="split"><div class="node take">Threat</div><div class="node give">Conservation</div></div><div class="arrow">↓</div><div class="node">Affected turtles / incremental cohort</div><div class="arrow">↓</div><div class="node">Growth · survival · first nesting<br>Sex · remigration</div><p><span class="take">Take ANE</span> and <span class="give">Give ANE</span>, assigned to future years.</p></div></div>
+<svg class="converge" viewBox="0 0 1000 40" preserveAspectRatio="none" aria-hidden="true"><path d="M240 0 Q240 22 500 22 Q760 22 760 0 M500 22 V40" fill="none" stroke="#287e78" stroke-width="2"/><path d="M494 33 L500 40 L506 33" fill="none" stroke="#287e78" stroke-width="2"/></svg>
+<div class="currency"><div class="eyebrow">Standardize</div><strong>Annual nesting females</strong><p>The shared currency of population status, demographic losses, and conservation gains.</p></div><div class="arrow">↓</div>
+<div class="walk-compare"><div class="eyebrow">Project → compare</div><h3>Different management. The same stochastic future.</h3><p>Start from the final annual-nester posterior. Subtract Take → apply background growth and process variation → add translated Give.</p><div class="scenario-branches"><span>Status quo</span><span class="take">Take</span><span class="give">Give</span><span>Take + Give</span></div><p><strong>Shared starting draws + paired U/Q + shared z</strong> make within-draw differences attributable to the management scenario.</p></div>
+<div class="outflow"><a class="button" href="index.html#impact">Explore the size-to-ANE translation →</a><a href="index.html">Open the scientific map</a></div><p class="fine">ANE preserves magnitude and timing. Give credits the incremental benefit above a counterfactual. Uncertainty and biological assumptions remain visible throughout.</p></div>
+```

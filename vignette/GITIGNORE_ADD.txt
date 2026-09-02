@@ -1,0 +1,5 @@
+# Quarto local build output
+_site/
+.quarto/
+# Optional website test/preview dependencies
+node_modules/

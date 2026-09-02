@@ -1,0 +1,7 @@
+.tour-start{margin-bottom:18px;border:1px solid #184f49;border-radius:999px;background:#184f49;color:#fff;padding:.7rem 1.2rem;font:inherit;font-weight:650;cursor:pointer;align-self:center;white-space:nowrap}
+.tour-start:hover{background:#28685f}.tour-start:focus-visible,.tour-dialog button:focus-visible{outline:3px solid #bf933e;outline-offset:3px}
+.tour-shade{position:fixed;inset:0;z-index:10000;background:transparent;touch-action:none}
+.tour-ring{position:fixed;z-index:10001;border:3px solid #c6a65b;border-radius:12px;box-shadow:0 0 0 9999px rgba(10,36,33,.5);pointer-events:none;box-sizing:border-box}
+.tour-dialog{position:fixed;z-index:10002;background:#fffdf6;color:#173e39;border:1px solid #d5ddcf;border-radius:18px;padding:22px;box-shadow:0 16px 60px #0e332c55;box-sizing:border-box;max-height:calc(100dvh - 24px);overflow:auto;font-family:system-ui,sans-serif}
+.tour-dialog h2{font-size:1.3rem;line-height:1.25;margin:.6rem 0 .7rem;color:#173e39}.tour-dialog p{font-size:1rem;line-height:1.55;margin:0 0 1.2rem}.tour-count{font-size:.75rem;letter-spacing:.035em;color:#527269}.tour-controls{display:flex;gap:8px;align-items:center}.tour-controls span{flex:1}.tour-controls button{font:inherit;font-size:.85rem;border:1px solid #bfcfc6;border-radius:9px;padding:8px 10px;background:transparent;color:#173e39;cursor:pointer}.tour-controls button[data-tour=next]{background:#184f49;color:white;border-color:#184f49}.tour-controls button:disabled{opacity:.4;cursor:default}
+@media print{.tour-start,.tour-shade,.tour-ring,.tour-dialog{display:none!important}}

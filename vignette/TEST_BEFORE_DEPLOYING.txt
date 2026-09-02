@@ -1,0 +1,23 @@
+SCIENTIFIC FRAMEWORK REDESIGN
+
+Overlay the files from Sea-Turtle-Population-Toolkit.zip in the Quarto project.
+Keep the Shiny app and other repository files.
+
+1. Run quarto render.
+2. Run npm install, then npm test (19 automated test groups).
+3. Run quarto preview.
+4. Confirm both pathways converge on annual nesting females.
+5. Exercise each data source and every nesting entry point.
+6. Test all three monitoring-loss patterns.
+7. Move starting size: 25% Linf gives about 0.024 ANE; 99% gives about 0.213.
+8. Test all three Give examples; equal counterfactual and intervention gives zero.
+9. Set Take and Give to zero and confirm exact scenario overlap.
+10. Open equations, assumptions, uncertainty, validation, and Methods.
+11. Inspect Walkthrough and narrow/mobile layouts, and test keyboard navigation.
+12. Run quarto render after any corrections.
+
+CURRENT REVIEW STATUS
+Quarto render and automated checks pass. Initial visual review completed.
+A Quarto column-style collision was fixed after that review. Browser security
+policy blocked the final visual pass; desktop/mobile browser QA is still required.
+No deployment was performed. Full details: REVIEW-NOTES.md.

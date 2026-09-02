@@ -1,0 +1,40 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - index.qmd
+    - walkthrough.qmd
+    - guide/developer.qmd
+  resources:
+    - assets/
+website:
+  title: "Sea Turtle Population Toolkit"
+  search: false
+  navbar:
+    background: light
+    left:
+      - href: index.qmd
+        text: Scientific map
+      - href: walkthrough.qmd
+        text: Walkthrough
+      - href: guide/developer.qmd
+        text: Methods & validation
+    right:
+      - text: GitHub ↗
+        href: https://github.com/AnnaOrtega-NOAA/sea-turtle-population-toolkit
+  page-footer:
+    left: "Sea Turtle Population Toolkit · Interactive methods"
+    right: "Model fitting and population evaluation remain in Shiny."
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: false
+    anchor-sections: false
+    title-block-banner: false
+    smooth-scroll: true
+    html-math-method: mathml
+    include-after-body:
+      text: '<script type="module" src="/assets/site.js"></script>'
+execute:
+  echo: false
