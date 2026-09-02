@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: "Sea Turtle Population Toolkit"
+message: "Please cite the associated methods manuscript and this software release when using the toolkit."
+type: software
+version: "0.1.0"
+date-released: "2026-09-01"
+authors:
+  - family-names: "Ortega"
+    given-names: "Anna Antonia"
