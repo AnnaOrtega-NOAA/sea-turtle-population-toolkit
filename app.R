@@ -2403,13 +2403,15 @@ draw_correlated_length_mortality <- function(
   )
 }
 
-
 draw_interaction_count <- function(
     expected_count,
     mode = c("fixed", "poisson", "cmp"),
-    cmp_nu = 1) {
+    cmp_nu = 1,
+    observer_coverage = 1.0,
+    count_type = c("total", "observed")) {
   
   mode <- match.arg(mode)
+  count_type <- match.arg(count_type)
   
   if (
     length(expected_count) != 1L ||
@@ -2417,18 +2419,32 @@ draw_interaction_count <- function(
     !is.finite(expected_count) ||
     expected_count < 0
   ) {
-    stop(
-      "Expected annual interactions must be one finite ",
-      "non-negative value."
-    )
+    stop("Expected annual interactions must be one finite non-negative value.")
+  }
+  
+  if (
+    length(observer_coverage) != 1L ||
+    is.na(observer_coverage) ||
+    !is.finite(observer_coverage) ||
+    observer_coverage <= 0 ||
+    observer_coverage > 1
+  ) {
+    stop("Observer coverage must be a proportion in (0, 1].")
+  }
+  
+  # Expand observed counts to total fleet interactions
+  fleet_expected <- if (count_type == "observed") {
+    expected_count / observer_coverage
+  } else {
+    expected_count
   }
   
   if (mode == "fixed") {
-    return(as.numeric(expected_count))
+    return(as.numeric(fleet_expected))
   }
   
   if (mode == "poisson") {
-    return(stats::rpois(1L, lambda = expected_count))
+    return(stats::rpois(1L, lambda = fleet_expected))
   }
   
   if (
@@ -2443,11 +2459,11 @@ draw_interaction_count <- function(
   as.integer(
     rCMP(
       n = 1L,
-      mu = expected_count,
+      mu = fleet_expected,
       nu = cmp_nu,
       x_max = max(
         200L,
-        as.integer(ceiling(4 * expected_count))
+        as.integer(ceiling(4 * fleet_expected))
       )
     )
   )
@@ -2964,6 +2980,8 @@ siders_fishery_ane_simulations <- function(
     stochastic_demography = TRUE,
     interaction_count_mode = c("fixed", "poisson", "cmp"),
     cmp_nu = 1,
+    observer_coverage = 1.0,
+    count_type = "total",
     log_length_sd = 0,
     logit_mortality_sd = 0,
     length_mortality_rho = 0,
@@ -3042,7 +3060,9 @@ siders_fishery_ane_simulations <- function(
         draw_interaction_count(
           expected_count = interactions[year_index],
           mode = interaction_count_mode,
-          cmp_nu = cmp_nu
+          cmp_nu = cmp_nu,
+          observer_coverage = observer_coverage,  
+          count_type = count_type                 
         )
       },
       numeric(1L)
@@ -4591,6 +4611,15 @@ validate_threat_schedule <- function(schedule, projection_years) {
     stop("Each year with turtles requires mortality between 0 and 1.")
   }
   
+  if ("observer_coverage" %in% names(schedule)) {
+    coverage <- suppressWarnings(as.numeric(schedule$observer_coverage))
+    if (any(active & (is.na(coverage) | coverage <= 0 | coverage > 1))) {
+      stop("observer_coverage must be a proportion between 0 (exclusive) and 1.")
+    }
+    schedule$observer_coverage <- coverage
+  } else {
+    schedule$observer_coverage <- 1.0  # Default to 100% coverage / total counts
+  }
   schedule <- schedule[schedule$year %in% projection_years, , drop = FALSE]
   schedule <- schedule[match(projection_years, schedule$year), , drop = FALSE]
   rownames(schedule) <- NULL
@@ -4674,7 +4703,7 @@ ux_build_effects <- function(input, n_sims, horizon, transition_years) {
       # Generate a matched matrix of first-nesting-only fishery ANE losses.
       # Each row is one projection simulation. Biological and fishery uncertainty
       # are drawn from user-supplied distributions; zero SD retains fixed inputs.
-      make_fishery_loss <- function(
+  make_fishery_loss <- function(
     interactions,
     length_cm,
     mortality
@@ -4682,33 +4711,14 @@ ux_build_effects <- function(input, n_sims, horizon, transition_years) {
         
         params <- current_model_params(input)
         
-        count_mode <- if (
-          is.null(input$siders_count_mode)
-        ) {
-          "fixed"
-        } else {
-          input$siders_count_mode
-        }
+        coverage_val <- input$threat_observer_coverage %||% 1.0
+        count_type_val <- input$threat_count_type %||% "total"
         
-        cmp_nu <- if (
-          is.null(input$siders_cmp_nu) ||
-          !is.finite(input$siders_cmp_nu)
-        ) {
-          1
-        } else {
-          input$siders_cmp_nu
-        }
+        count_mode <- if (is.null(input$siders_count_mode)) "fixed" else input$siders_count_mode
+        cmp_nu <- if (is.null(input$siders_cmp_nu) || !is.finite(input$siders_cmp_nu)) 1 else input$siders_cmp_nu
         
         uncertainty_value <- function(input_value) {
-          if (
-            is.null(input_value) ||
-            length(input_value) != 1L ||
-            is.na(input_value) ||
-            !is.finite(input_value)
-          ) {
-            return(0)
-          }
-          
+          if (is.null(input_value) || length(input_value) != 1L || is.na(input_value) || !is.finite(input_value)) return(0)
           input_value
         }
         
@@ -4721,8 +4731,10 @@ ux_build_effects <- function(input, n_sims, horizon, transition_years) {
           
           # Retain demographic parameter uncertainty while using the
           # methods-paper expected first-nesting formulation.
-          stochastic_demography = TRUE,
+          observer_coverage = coverage_val,
+          count_type = count_type_val,
           
+          stochastic_demography = TRUE,
           interaction_count_mode = count_mode,
           cmp_nu = cmp_nu,
           
@@ -5384,8 +5396,14 @@ ux_threat_ui <- function() tagList(
   # --- EXISTING STATIC INPUTS ---
   conditionalPanel("input.threat_input_type == 'static'",
                    numericInput("threat_interactions", "Turtles affected per year", 150, min = 0),
+                   numericInput("threat_observer_coverage", "Observer coverage proportion (0–1)", 0.20, min = 0.01, max = 1.0, step = 0.05),
+                   radioButtons("threat_count_type", "Input count type:",
+                                c("Observed interactions (expand by coverage)" = "observed",
+                                  "Estimated total fleet interactions" = "total"),
+                                selected = "observed"),
                    numericInput("threat_mean_len", "Median carapace length (cm)", 65, min = .1),
                    numericInput("threat_mort_score", "Mortality probability (0–1)", .35, min = 0, max = 1, step = .01),
+                   actionButton("open_st_modal", "⚡ Parameter Sensitivity Sweep (ST)...", class = "btn-outline-primary btn-sm mt-2"),
                    helpText("Count turtles before applying mortality. A probability of 0.35 means 35% die from the interaction.")
   ),
   
@@ -7200,6 +7218,131 @@ server <- function(input, output, session) {
     "Strategy E Only"    = "#CC79A7",
     "Combined Portfolio" = "#0072B2"
   )
+ 
+  # =====================================================================
+  # PARAMETER SENSITIVITY TEST (ST) WIZARD & GENERATOR
+  # =====================================================================
+  
+  # 1. OPEN SENSITIVITY TEST MODAL
+  observeEvent(input$open_st_modal, {
+    showModal(modalDialog(
+      title = tags$div(shiny::icon("sliders"), " Parameter Sensitivity Sweep Wizard"),
+      easyClose = TRUE, size = "m",
+      
+      div(class = "alert alert-info p-2 mb-3", style = "font-size: 0.85rem;",
+          tags$b("Sensitivity Sweep: "),
+          "Vary a threat parameter across a Min/Max/Step range. The toolkit will generate and save a separate scenario for each step so you can compare them side-by-side in Step 5."
+      ),
+      
+      selectInput("st_param_choice", "Select Parameter to Sweep:",
+                  choices = c(
+                    "Observer Coverage Proportion (e.g. 0.05 to 0.30)" = "threat_observer_coverage",
+                    "Annual Turtle Interactions"                       = "threat_interactions",
+                    "Mortality Risk Probability (0 to 1)"             = "threat_mort_score",
+                    "Median Carapace Length (cm)"                      = "threat_mean_len"
+                  ),
+                  selected = "threat_observer_coverage"),
+      
+      fluidRow(
+        column(4, numericInput("st_min", "Min Value", value = 0.05, step = 0.01)),
+        column(4, numericInput("st_max", "Max Value", value = 0.30, step = 0.01)),
+        column(4, numericInput("st_step", "Step / Interval", value = 0.05, step = 0.01))
+      ),
+      
+      uiOutput("st_sweep_preview"),
+      
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("generate_st_scenarios", "Generate & Queue Scenarios", class = "btn-primary")
+      )
+    ))
+  })
+  
+  # Live Preview of Generated Values in Modal
+  output$st_sweep_preview <- renderUI({
+    req(input$st_min, input$st_max, input$st_step)
+    if (input$st_max < input$st_min || input$st_step <= 0) {
+      return(div(class = "text-danger style='font-size: 0.85rem;'", "Max must be greater than Min, and Step must be > 0."))
+    }
+    vals <- seq(input$st_min, input$st_max, by = input$st_step)
+    div(class = "alert alert-secondary mt-2 p-2", style = "font-size: 0.82rem;",
+        tags$b("Scenarios to generate (", length(vals), "): "),
+        paste(vals, collapse = ", ")
+    )
+  })
+  
+  # 2. GENERATE & SAVE SCENARIOS FROM SWEEP
+  observeEvent(input$generate_st_scenarios, {
+    req(input$st_min, input$st_max, input$st_step, input$st_param_choice)
+    
+    min_v  <- input$st_min
+    max_v  <- input$st_max
+    step_v <- input$st_step
+    param_key <- input$st_param_choice
+    
+    validate(need(max_v >= min_v && step_v > 0, "Invalid sweep range settings."))
+    
+    sweep_vals <- seq(min_v, max_v, by = step_v)
+    
+    # Base scenario settings from current UI inputs
+    base_name <- trimws(input$ux_scenario_name %||% "Threat Baseline")
+    if (!nzchar(base_name)) base_name <- "Threat Baseline"
+    
+    base_values <- list(
+      pva_mode = "mode_threat",
+      threat_input_type = "static",
+      threat_interactions = input$threat_interactions %||% 150,
+      threat_observer_coverage = input$threat_observer_coverage %||% 0.20,
+      threat_count_type = input$threat_count_type %||% "observed",
+      threat_mean_len = input$threat_mean_len %||% 65,
+      threat_mort_score = input$threat_mort_score %||% 0.35,
+      siders_fishery_center_mode = "direct",
+      siders_force_all_fatal = FALSE
+    )
+    base_values <- modifyList(base_values, ux_shared_values())
+    
+    param_label <- switch(param_key,
+                          "threat_observer_coverage" = "Coverage",
+                          "threat_interactions"        = "Takes",
+                          "threat_mort_score"         = "Mortality",
+                          "threat_mean_len"           = "Size",
+                          "Value"
+    )
+    
+    new_ids <- c()
+    
+    for (val in sweep_vals) {
+      val_formatted <- if (param_key %in% c("threat_observer_coverage", "threat_mort_score")) {
+        paste0(round(val * 100, 1), "%")
+      } else {
+        as.character(val)
+      }
+      
+      scen_name <- paste0(base_name, " (", param_label, " ", val_formatted, ")")
+      scen_id   <- paste0("scen_st_", ux$next_id)
+      ux$next_id <- ux$next_id + 1L
+      
+      scen_vals <- base_values
+      scen_vals[[param_key]] <- val
+      
+      ux$scenarios[[scen_id]] <- list(
+        id = scen_id,
+        name = scen_name,
+        values = scen_vals,
+        saved_at = Sys.time()
+      )
+      
+      new_ids <- c(new_ids, scen_id)
+    }
+    
+    # Auto-select all newly created sensitivity scenarios in the comparison list
+    choices <- setNames(names(ux$scenarios), vapply(ux$scenarios, `[[`, character(1), "name"))
+    existing_selected <- isolate(input$ux_compare_ids) %||% character(0)
+    updateCheckboxGroupInput(session, "ux_compare_ids", choices = choices, selected = unique(c(existing_selected, new_ids)))
+    
+    removeModal()
+    showNotification(sprintf("Generated & queued %d sensitivity scenarios!", length(sweep_vals)), type = "message", duration = 6)
+  })
   
   # --- SPECIES PRESET UPDATER ---
   
@@ -8121,12 +8264,15 @@ server <- function(input, output, session) {
   
   # Sensitivity comparisons use named copies of scenarios in the shared
   # comparison engine. This replaces the former separate plotting engine.
-
   # --- MASTER SIMULATION ENGINE ---
   observeEvent(input$ux_run_comparison, {
     if (!ux_require_fit()) return(invisible(NULL))
     if (!ux_comparison_valid()) return(invisible(NULL))
-    tryCatch(withProgress(message = "Projecting selected scenarios…", value = 0, {
+    
+    selected <- input$ux_compare_ids %||% character(0)
+    n_scen   <- length(selected)
+    
+    tryCatch(withProgress(message = "Initializing PVA projection...", value = 0, {
       n_sims   <- req(input$pva_sims)
       horizon  <- req(input$pva_years)
       sel_site <- if(!is.null(input$pva_site_filter)) input$pva_site_filter else "All Beaches (Regional Total)"
@@ -8154,138 +8300,70 @@ server <- function(input, output, session) {
       # ---------------------------------------------------------------
       # MATCHED STARTING ABUNDANCE, U, AND Q
       # ---------------------------------------------------------------
-      
       if (sel_site == "All Beaches (Regional Total)") {
-        
-        # The original Siders projection begins with the final modeled
-        # regional annual-nester abundance, N_fym0.
-        #
-        # Total_Females is retained separately as the RI/4 estimate of current
-        # adult-female abundance for reporting; it is not the projection N0.
-        
-        regional_posterior <-
-          build_siders_projection_posterior(
-            trend_result = vault$res,
-            remigration_interval = input$remig_int
-          )
-        
-        valid_rows <- seq_len(
-          nrow(regional_posterior)
+        regional_posterior <- build_siders_projection_posterior(
+          trend_result = vault$res,
+          remigration_interval = input$remig_int
         )
-        
-        draw_index <- sample(
-          valid_rows,
-          size = n_sims,
-          replace = TRUE
-        )
-        
-        selected_posterior <-
-          regional_posterior[
-            draw_index,
-            ,
-            drop = FALSE
-          ]
-        
-        start_abund <-
-          selected_posterior$N_fym0
-        
+        valid_rows <- seq_len(nrow(regional_posterior))
+        draw_index <- sample(valid_rows, size = n_sims, replace = TRUE)
+        selected_posterior <- regional_posterior[draw_index, , drop = FALSE]
+        start_abund <- selected_posterior$N_fym0
         U_draws <- selected_posterior$U
         Q_draws <- selected_posterior$Q
-        
-        post_matrix <- as.matrix(
-          regional_posterior[
-            ,
-            c("U", "Q"),
-            drop = FALSE
-          ]
-        )
-        
+        post_matrix <- as.matrix(regional_posterior[, c("U", "Q"), drop = FALSE])
       } else {
-        
-        # Site-specific projections remain annual-nester projections because the
-        # original Siders RI/4 helper estimates regional adult-female abundance.
-        # Do not silently apply the regional four-year expansion to one beach.
-        
-        n_joint <- min(
-          length(X_T),
-          length(U),
-          length(Q)
-        )
-        
-        post_matrix <- cbind(
-          X_T = X_T[seq_len(n_joint)],
-          U = U[seq_len(n_joint)],
-          Q = Q[seq_len(n_joint)]
-        )
-        
-        valid_rows <- which(
-          complete.cases(post_matrix) &
-            post_matrix[, "Q"] > 0
-        )
-        
-        if (length(valid_rows) < 2L) {
-          stop(
-            "Too few valid joint posterior draws ",
-            "for the site-specific projection."
-          )
-        }
-        
-        draw_index <- sample(
-          valid_rows,
-          n_sims,
-          replace = TRUE
-        )
-        
-        future_params <- post_matrix[
-          draw_index,
-          ,
-          drop = FALSE
-        ]
-        
+        n_joint <- min(length(X_T), length(U), length(Q))
+        post_matrix <- cbind(X_T = X_T[seq_len(n_joint)], U = U[seq_len(n_joint)], Q = Q[seq_len(n_joint)])
+        valid_rows <- which(complete.cases(post_matrix) & post_matrix[, "Q"] > 0)
+        if (length(valid_rows) < 2L) stop("Too few valid joint posterior draws for site-specific projection.")
+        draw_index <- sample(valid_rows, n_sims, replace = TRUE)
+        future_params <- post_matrix[draw_index, , drop = FALSE]
         X_start_draws <- future_params[, "X_T"]
         U_draws <- future_params[, "U"]
         Q_draws <- future_params[, "Q"]
-        
-        a_draw <- if (
-          !is.null(sims$A) &&
-          !is.na(match(sel_site, vault$res$sites)) &&
-          match(sel_site, vault$res$sites) <= ncol(sims$A)
-        ) {
+        a_draw <- if (!is.null(sims$A) && !is.na(match(sel_site, vault$res$sites)) && match(sel_site, vault$res$sites) <= ncol(sims$A)) {
           sims$A[draw_index, match(sel_site, vault$res$sites)]
-        } else {
-          0
-        }
-        
-        start_abund <- exp(
-          X_start_draws + a_draw
-        )
+        } else 0
+        start_abund <- exp(X_start_draws + a_draw)
       }
       
       start_yr <- max(vault$years)
       transition_years <- start_yr + seq_len(horizon)
       zero_effect <- rep(0, horizon)
       track_effects <- list("Status Quo" = list(loss = zero_effect, gain = zero_effect))
-      selected <- input$ux_compare_ids %||% character(0)
-      for (id in selected) {
+      
+      # ---------------------------------------------------------------
+      # BUILD SCENARIOS WITH REAL-TIME PROGRESS BAR
+      # ---------------------------------------------------------------
+      for (idx in seq_along(selected)) {
+        id <- selected[idx]
         scenario <- ux$scenarios[[id]]
+        
+        # Step progress update for the current scenario
+        setProgress(
+          value = (idx - 0.5) / (n_scen + 1),
+          message = sprintf("Building scenario %d of %d...", idx, n_scen),
+          detail = scenario$name
+        )
+        
         values <- ux_scenario_values(scenario)
         effects <- ux_build_effects(values, n_sims, horizon, transition_years)
-        effect_name <- switch(values$pva_mode, mode_threat = "With Threat",
-                              mode_action = "With Intervention", mode_portfolio = "Combined Portfolio")
+        effect_name <- switch(values$pva_mode, 
+                              mode_threat = "With Threat",
+                              mode_action = "With Intervention", 
+                              mode_portfolio = "Combined Portfolio")
         track_effects[[scenario$name]] <- effects[[effect_name]]
       }
+      
       N_mats <- list()
-      for (scen in names(track_effects)) { mat <- matrix(NA, nrow = n_sims, ncol = horizon + 1); mat[, 1] <- start_abund; N_mats[[scen]] <- mat }
-
-      # Legacy take projections use dynUQ = TRUE. Dynamic mode resamples a
-      # complete U/Q posterior pair for every simulation-year. Static mode
-      # retains one U/Q pair for each full trajectory. Indices and shocks are
-      # generated once and shared by every scenario.
-      uq_mode <- if (is.null(input$projection_uq_mode)) {
-        "dynamic"
-      } else {
-        input$projection_uq_mode
+      for (scen in names(track_effects)) { 
+        mat <- matrix(NA, nrow = n_sims, ncol = horizon + 1)
+        mat[, 1] <- start_abund
+        N_mats[[scen]] <- mat 
       }
+      
+      uq_mode <- if (is.null(input$projection_uq_mode)) "dynamic" else input$projection_uq_mode
       annual_uq <- draw_projection_uq(
         post_matrix = post_matrix,
         valid_rows = valid_rows,
@@ -8296,25 +8374,27 @@ server <- function(input, output, session) {
       annual_U <- annual_uq$U
       annual_Q <- annual_uq$Q
       
+      # ---------------------------------------------------------------
+      # RUN ANNUAL PROJECTIONS
+      # ---------------------------------------------------------------
+      setProgress(
+        value = n_scen / (n_scen + 1), 
+        message = "Running matrix projections...", 
+        detail = sprintf("%d scenarios across %d years", n_scen + 1, horizon)
+      )
+      
       for (t in 1:horizon) {
-        incProgress(1/horizon, detail = paste("Simulating year", t))
+        incProgress(
+          1 / (horizon * (n_scen + 1)), 
+          detail = sprintf("Simulating projection year %d of %d", t, horizon)
+        )
         standard_normal <- rnorm(n_sims)
         for (scen in names(track_effects)) {
           loss_object <- track_effects[[scen]]$loss
           gain_object <- track_effects[[scen]]$gain
-          loss <- if (is.matrix(loss_object)) {
-            loss_object[, t]
-          } else {
-            loss_object[t]
-          }
-          gain <- if (is.matrix(gain_object)) {
-            gain_object[, t]
-          } else {
-            gain_object[t]
-          }
-          # Siders timing for fishery loss: subtract ANE before population
-          # growth. The same standard-normal shock is shared by all scenarios.
-          # Conservation gains are an explicit extension and enter afterward.
+          loss <- if (is.matrix(loss_object)) loss_object[, t] else loss_object[t]
+          gain <- if (is.matrix(gain_object)) gain_object[, t] else gain_object[t]
+          
           N_next <- project_population_step(
             abundance = N_mats[[scen]][, t],
             loss = loss,
@@ -8323,7 +8403,6 @@ server <- function(input, output, session) {
             Q = annual_Q[, t],
             standard_normal = standard_normal
           )
-
           N_mats[[scen]][, t + 1] <- N_next
         }
       }
@@ -8333,13 +8412,15 @@ server <- function(input, output, session) {
       for (scen in names(track_effects)) { 
         plot_list[[scen]] <- data.frame(
           Year = rep(proj_years, each = n_sims), 
-          SimID = rep(1:n_sims, times = length(proj_years)), # <-- Added to track specific trajectories
+          SimID = rep(1:n_sims, times = length(proj_years)),
           N = as.vector(N_mats[[scen]]), 
           Scenario = scen
         ) 
       }
       plot_data <- bind_rows(plot_list)
-      summary_data <- plot_data %>% group_by(Year, Scenario) %>% summarize(Median = median(N, na.rm = TRUE), Lower = quantile(N, 0.025, na.rm = TRUE), Upper = quantile(N, 0.975, na.rm = TRUE), .groups = 'drop')
+      summary_data <- plot_data %>% 
+        group_by(Year, Scenario) %>% 
+        summarize(Median = median(N, na.rm = TRUE), Lower = quantile(N, 0.025, na.rm = TRUE), Upper = quantile(N, 0.975, na.rm = TRUE), .groups = 'drop')
       
       ux$result_signature <- isolate(ux_comparison_signature())
       ux$result_time <- Sys.time()
@@ -8347,25 +8428,14 @@ server <- function(input, output, session) {
       ux$result_biology <- isolate(ux_shared_values())
       nav_select("wizard_steps", "results")
       vault$step5_summary <- summary_data
-      vault$step5_raw <- plot_data # <-- Save raw data for quasi-extinction math
+      vault$step5_raw <- plot_data
       vault$step5_metadata <- list(
-        starting_abundance_method = if (
-          sel_site == "All Beaches (Regional Total)"
-        ) {
-          paste(
-            "Original Siders projection N0:",
-            "final modeled regional annual-nester posterior (N_fym0)"
-          )
+        starting_abundance_method = if (sel_site == "All Beaches (Regional Total)") {
+          "Original Siders projection N0: final modeled regional annual-nester posterior (N_fym0)"
         } else {
           "Site-specific final annual-nester posterior"
         },
-        
-        population_update_method = paste(
-          "Siders abundance-scale projection:",
-          "(N - ANE) * exp(U) + Normal(0, sqrt(Q));",
-          "conservation gain added separately"
-        ),
-        
+        population_update_method = "Siders abundance-scale projection: (N - ANE) * exp(U) + Normal(0, sqrt(Q)); conservation gain added separately",
         paper_reference = "Methods_ConsBio_20260831.pdf, Eqs. 7-22",
         threat_schedule_columns = c("year", "turtles", "median_cm", "mortality"),
         transition_year_convention = "year is the destination census",
