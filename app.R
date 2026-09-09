@@ -5403,7 +5403,7 @@ ux_threat_ui <- function() tagList(
                                 selected = "observed"),
                    numericInput("threat_mean_len", "Median carapace length (cm)", 65, min = .1),
                    numericInput("threat_mort_score", "Mortality probability (0–1)", .35, min = 0, max = 1, step = .01),
-                   actionButton("open_st_modal", "⚡ Parameter Sensitivity Sweep (ST)...", class = "btn-outline-primary btn-sm mt-2"),
+                   actionButton("open_st_modal", "Parameter Sensitivity Test (ST)", class = "btn-outline-primary btn-sm mt-2"),
                    helpText("Count turtles before applying mortality. A probability of 0.35 means 35% die from the interaction.")
   ),
   
