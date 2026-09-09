@@ -4531,8 +4531,9 @@ run_mathematical_self_checks <- function(
 }
 
 
-# Threat-schedule contract. All modeled years are explicit; no silent zero fill.
-# Optional uncertainty applies AFTER these direct annual inputs are validated.
+# =====================================================================
+# THREAT SCHEDULE CONTRACT (AUTO-EXTENDS RETROACTIVE DATA INTO FORECAST YEARS)
+# =====================================================================
 validate_threat_schedule <- function(schedule, projection_years) {
   required <- c("year", "turtles", "median_cm", "mortality")
   if (!is.data.frame(schedule) || !all(required %in% names(schedule))) {
@@ -4542,6 +4543,7 @@ validate_threat_schedule <- function(schedule, projection_years) {
   if (anyDuplicated(names(schedule))) stop("Threat CSV has duplicate column names.")
   schedule <- schedule[, required, drop = FALSE]
   if (!nrow(schedule)) stop("Threat schedule is empty.")
+  
   for (column in required) {
     x <- schedule[[column]]
     if (is.factor(x)) x <- as.character(x)
@@ -4550,13 +4552,37 @@ validate_threat_schedule <- function(schedule, projection_years) {
     if (any(!blank & !is.finite(y))) stop(column, " must be numeric and finite.")
     schedule[[column]] <- y
   }
+  
   if (any(!is.finite(schedule$year)) || any(schedule$year != floor(schedule$year))) {
     stop("year must contain whole calendar years.")
   }
   if (anyDuplicated(schedule$year)) stop("Threat schedule has duplicate years.")
-  if (any(!is.finite(schedule$turtles)) || any(schedule$turtles < 0)) {
-    stop("turtles must contain finite non-negative counts; use 0 explicitly.")
+  
+  # Auto-extend retroactive/historical CSV rows into future forecast years
+  missing <- setdiff(projection_years, schedule$year)
+  if (length(missing) > 0) {
+    avail_turtles <- schedule$turtles[!is.na(schedule$turtles)]
+    avail_sizes   <- schedule$median_cm[!is.na(schedule$median_cm) & schedule$median_cm > 0]
+    avail_morts   <- schedule$mortality[!is.na(schedule$mortality)]
+    
+    default_turtles <- if (length(avail_turtles) > 0) avail_turtles else 0
+    default_sizes   <- if (length(avail_sizes) > 0) avail_sizes else 65
+    default_morts   <- if (length(avail_morts) > 0) avail_morts else 0.35
+    
+    safe_draw <- function(vec, n) {
+      if (length(vec) <= 1) rep(vec, n) else sample(vec, n, replace = TRUE)
+    }
+    
+    ext_df <- data.frame(
+      year = missing,
+      turtles = safe_draw(default_turtles, length(missing)),
+      median_cm = safe_draw(default_sizes, length(missing)),
+      mortality = safe_draw(default_morts, length(missing)),
+      stringsAsFactors = FALSE
+    )
+    schedule <- rbind(schedule, ext_df)
   }
+  
   active <- schedule$turtles > 0
   if (any(!is.finite(schedule$median_cm[active])) || any(schedule$median_cm[active] <= 0)) {
     stop("Each year with turtles requires a positive median_cm.")
@@ -4564,19 +4590,34 @@ validate_threat_schedule <- function(schedule, projection_years) {
   if (any(!is.finite(schedule$mortality[active]))) {
     stop("Each year with turtles requires mortality between 0 and 1.")
   }
-  supplied_length <- !is.na(schedule$median_cm)
-  supplied_mortality <- !is.na(schedule$mortality)
-  if (any(schedule$median_cm[supplied_length] <= 0) ||
-      any(schedule$mortality[supplied_mortality] < 0 | schedule$mortality[supplied_mortality] > 1)) {
-    stop("Sizes must be positive; mortality is a proportion from 0 to 1, not a percent.")
-  }
-  missing <- setdiff(projection_years, schedule$year)
-  outside <- setdiff(schedule$year, projection_years)
-  if (length(missing)) stop("Threat schedule is missing forecast years: ", paste(missing, collapse = ", "))
-  if (length(outside)) stop("Threat schedule contains years outside the forecast: ", paste(outside, collapse = ", "))
+  
+  schedule <- schedule[schedule$year %in% projection_years, , drop = FALSE]
   schedule <- schedule[match(projection_years, schedule$year), , drop = FALSE]
   rownames(schedule) <- NULL
   schedule
+}
+
+# =====================================================================
+# ACTION SCHEDULE CONTRACT (AUTO-EXTENDS RETROACTIVE DATA INTO FORECAST YEARS)
+# =====================================================================
+ux_action_schedule <- function(d, years) {
+  if (!is.data.frame(d) || !all(c("Year", "Amount") %in% names(d))) stop("Action CSV needs the exact headers Year,Amount.")
+  if (anyDuplicated(names(d))) stop("The action CSV contains duplicate column headers.")
+  if (!nrow(d) || !is.numeric(d$Year) || any(!is.finite(d$Year)) || any(d$Year != floor(d$Year))) stop("Year must contain whole years.")
+  if (anyDuplicated(d$Year)) stop("Each forecast year must appear once in the action CSV.")
+  if (!is.numeric(d$Amount) || any(!is.finite(d$Amount)) || any(d$Amount < 0)) stop("Amount must contain finite non-negative numbers; enter 0 for years without actions.")
+  
+  # Auto-extend action schedule into future forecast years using the last known level
+  missing <- setdiff(years, d$Year)
+  if (length(missing) > 0) {
+    last_val <- if (nrow(d) > 0) tail(d$Amount[!is.na(d$Amount)], 1) else 0
+    if (length(last_val) == 0) last_val <- 0
+    ext_d <- data.frame(Year = missing, Amount = last_val, stringsAsFactors = FALSE)
+    d <- rbind(d, ext_d)
+  }
+  
+  d <- d[d$Year %in% years, , drop = FALSE]
+  d[match(years, d$Year), c("Year", "Amount"), drop = FALSE]
 }
 
 make_threat_template <- function(projection_years) {
@@ -4769,16 +4810,15 @@ ux_build_effects <- function(input, n_sims, horizon, transition_years) {
             loss = annual_loss, gain = zero_effect
           )
         } else {
-          req(input$threat_csv)
+          schedule_data <- input$ux_threat_data %||% {
+            req(input$threat_csv)
+            read.csv(input$threat_csv$datapath, check.names = FALSE)
+          }
           if (!identical(input$siders_fishery_center_mode %||% "direct", "direct") ||
               isTRUE(input$siders_force_all_fatal)) {
-            stop("For a CSV threat schedule, select direct annual inputs and turn off the all-fatal override.")
+            stop("For schedule inputs, select direct annual inputs and turn off the all-fatal override.")
           }
-          t_aligned <- validate_threat_schedule(
-            input$ux_threat_data %||% read.csv(input$threat_csv$datapath, check.names = FALSE), transition_years
-          )
-          # Placeholders below are used only in zero-count years, whose kernel
-          # is skipped; they are not biological estimates or missing-data fills.
+          t_aligned <- validate_threat_schedule(schedule_data, transition_years)
           t_aligned$median_cm[is.na(t_aligned$median_cm)] <- 1
           t_aligned$mortality[is.na(t_aligned$mortality)] <- 0
           track_effects[["With Threat"]] <- list(
@@ -5234,24 +5274,15 @@ ux_nonnegative <- function(x, label) {
   x
 }
 ux_action_type <- function(x) switch(x, "A: Protect Nests" = "nests", "B: Headstarting" = "yearlings", "C: Stop Adult Poaching" = "adults", stop("Choose a conservation action."))
-ux_action_schedule <- function(d, years) {
-  if (!is.data.frame(d) || !all(c("Year", "Amount") %in% names(d))) stop("Action CSV needs the exact headers Year,Amount.")
-  if (anyDuplicated(names(d))) stop("The action CSV contains duplicate column headers.")
-  if (!nrow(d) || !is.numeric(d$Year) || any(!is.finite(d$Year)) || any(d$Year != floor(d$Year))) stop("Year must contain whole years.")
-  if (anyDuplicated(d$Year)) stop("Each forecast year must appear once in the action CSV.")
-  if (!is.numeric(d$Amount) || any(!is.finite(d$Amount)) || any(d$Amount < 0)) stop("Amount must contain finite non-negative numbers; enter 0 for years without actions.")
-  missing <- setdiff(years, d$Year); outside <- setdiff(d$Year, years)
-  if (length(missing)) stop("Action schedule is missing forecast years: ", paste(missing, collapse = ", "), ". Enter explicit zero amounts where needed.")
-  if (length(outside)) stop("Action schedule contains years outside this forecast: ", paste(outside, collapse = ", "))
-  d[match(years, d$Year), c("Year", "Amount"), drop = FALSE]
-}
 ux_validate_scenario <- function(v, years) {
   params <- current_model_params(v)
   if (!length(years)) stop("Estimate the population before creating scenarios.")
   if (v$pva_mode == "mode_threat") {
-    if (v$threat_input_type == "table") {
-      if (is.null(v$ux_threat_data)) stop("Upload a threat schedule or download its example CSV first.")
-      if (!identical(v$siders_fishery_center_mode %||% "direct", "direct") || isTRUE(v$siders_force_all_fatal)) stop("CSV schedules use annual median size and mortality. Select that model and leave the all-fatal override off.")
+    if (v$threat_input_type %in% c("table", "builder")) {
+      if (is.null(v$ux_threat_data)) stop("Generate/apply a schedule or upload a CSV first.")
+      if (!identical(v$siders_fishery_center_mode %||% "direct", "direct") || isTRUE(v$siders_force_all_fatal)) {
+        stop("Schedule inputs use annual median size and mortality. Select direct annual inputs and leave the all-fatal override off.")
+      }
       d <- validate_threat_schedule(v$ux_threat_data, years)
     } else {
       ux_nonnegative(v$threat_interactions, "Annual turtles affected")
@@ -5317,25 +5348,53 @@ ux_validate_scenario <- function(v, years) {
 
 
 ux_threat_ui <- function() tagList(
-  h4("Threat: fishery interactions"),
-  radioButtons("threat_input_type", "How do the annual amounts vary?",
-               c("Same each year"="static", "Upload annual schedule"="table"), selected="table"),
-  conditionalPanel("input.threat_input_type == 'static'",
-    numericInput("threat_interactions", "Turtles affected per year", 150, min=0),
-    numericInput("threat_mean_len", "Median carapace length (cm)", 65, min=.1),
-    numericInput("threat_mort_score", "Mortality probability (0–1)", .35, min=0, max=1, step=.01),
-    helpText("Count turtles before applying mortality. A probability of 0.35 means 35% die from the interaction.")
+  h4("Threat: fishery interactions & poaching"),
+  radioButtons("threat_input_type", "How do you want to input annual threat data?",
+               c("Guided scenario builder" = "builder",
+                 "Same each year" = "static", 
+                 "Upload annual CSV schedule" = "table"), 
+               selected = "builder"),
+  
+  # --- GUIDED BUILDER FOR HISTORICAL REDUCTIONS ---
+  conditionalPanel("input.threat_input_type == 'builder'",
+                   div(class = "alert alert-info p-2 mb-3", style = "font-size: 0.85rem;",
+                       tags$b("Guided Threat Builder: "),
+                       "Enter a high historical baseline take and the year it was reduced (e.g. 2018)."
+                   ),
+                   fluidRow(
+                     column(6, numericInput("builder_start_year", "Start year", 2017, step = 1)),
+                     column(6, numericInput("builder_end_year", "End year", 2025, step = 1))
+                   ),
+                   fluidRow(
+                     column(6, numericInput("builder_reduction_year", "Year reduction took effect", 2018, step = 1)),
+                     column(6, numericInput("builder_baseline_take", "Pre-reduction annual take", 500, min = 0))
+                   ),
+                   fluidRow(
+                     column(6, numericInput("builder_reduced_take", "Post-reduction annual take", 75, min = 0)),
+                     column(6, numericInput("builder_female_prop", "Female proportion (0–1)", 0.65, min = 0, max = 1, step = 0.05))
+                   ),
+                   fluidRow(
+                     column(6, numericInput("builder_mean_cm", "Median carapace length (cm)", 65, min = 0.1)),
+                     column(6, numericInput("builder_mortality", "Mortality rate (0–1)", 0.35, min = 0, max = 1, step = 0.05))
+                   ),
+                   actionButton("apply_builder_schedule", "Generate & Apply Schedule", class = "btn-sm btn-primary mb-2"),
+                   downloadButton("download_builder_csv", "Download Template CSV", class = "btn-sm btn-outline-secondary mb-2")
   ),
+  
+  # --- EXISTING STATIC INPUTS ---
+  conditionalPanel("input.threat_input_type == 'static'",
+                   numericInput("threat_interactions", "Turtles affected per year", 150, min = 0),
+                   numericInput("threat_mean_len", "Median carapace length (cm)", 65, min = .1),
+                   numericInput("threat_mort_score", "Mortality probability (0–1)", .35, min = 0, max = 1, step = .01),
+                   helpText("Count turtles before applying mortality. A probability of 0.35 means 35% die from the interaction.")
+  ),
+  
+  # --- EXISTING TABLE UPLOAD INPUTS ---
   conditionalPanel("input.threat_input_type == 'table'",
-    p("Each row gives the number of turtles affected in one year, their median size, and their probability of dying."),
-    downloadButton("download_threat_template", "Download example CSV", class="btn-outline-primary"),
-    fileInput("threat_csv", "Upload threat schedule (.csv)", accept=".csv"),
-    helpText("Columns: year, turtles, median_cm, mortality. Include every forecast year; use 0 turtles in years without interactions."),
-    tags$details(tags$summary("Size, mortality and year definitions"),
-      p("Use the carapace-length measure specified by the growth model. The median represents the cohort unless size variation is supplied under Input uncertainty."),
-      p("Mortality includes immediate and delayed deaths. Enter 0.35 for 35%; do not multiply the turtle count by this probability beforehand."),
-      p("Year is the ending census: 2026 represents the transition from 2025 to 2026. Size and mortality may be blank only when turtles = 0."),
-      p("CSV schedules use direct annual size and mortality inputs. Enter mortality = 1 for an all-fatal year instead of using the regression-mode override."))
+                   p("Each row gives the number of turtles affected in one year, their median size, and their probability of dying."),
+                   downloadButton("download_threat_template", "Download example CSV", class="btn-outline-primary"),
+                   fileInput("threat_csv", "Upload threat schedule (.csv)", accept=".csv"),
+                   helpText("Columns: year, turtles, median_cm, mortality. Include every forecast year; use 0 turtles in years without interactions.")
   )
 )
 ux_action_ui <- function() tagList(
@@ -5921,6 +5980,178 @@ ux_back_next <- function(back_id, back_label, next_id, next_label) div(class="ux
   if (!is.null(back_id)) actionButton(back_id, back_label, class="btn-link"),
   if (!is.null(next_id)) actionButton(next_id, next_label, class="btn-primary"))
 
+ux_caveats_monitoring_ui <- function() {
+  tagList(
+    tags$details(
+      tags$summary("⚠️ Model Assumptions, Limitations & Future Monitoring Advice"), # Fixed: Added tags$
+      div(class = "ux-panel mt-2", style = "background-color: #fcfbf7; border-left: 4px solid #185e55;",
+          h5("Key Caveats for this Scenario"),
+          tags$ul(style = "font-size: 0.88rem; color: #596a66;",
+                  tags$li(tags$b("Static Sex & Size Structure: "), "Assumes the size distribution (CCL) and sex ratio of impacted turtles were constant across all years (2017–2025). Real fisheries and coastal threats often vary by season and location."),
+                  tags$li(tags$b("Lagged Population Response: "), "Because sea turtles take 15–30 years to mature, reducing threat levels on juveniles or eggs will not appear in nesting beach counts for several decades."),
+                  tags$li(tags$b("Counterfactual Baseline: "), "Projections compare observed/reduced takes against a baseline assuming pre-reduction threat rates continued indefinitely.")
+          ),
+          hr(),
+          h5("How to Upgrade Your Data for Future Monitoring"),
+          div(class = "table-responsive",
+              tags$table(class = "table table-sm table-bordered", style = "font-size: 0.82rem;",
+                         tags$thead(
+                           tags$tr(
+                             tags$th("Current Input (Best Guess)"),
+                             tags$th("Recommended Future Data"),
+                             tags$th("Scientific Benefit")
+                           )
+                         ),
+                         tags$tbody(
+                           tags$tr(
+                             tags$td("Single overall median size (cm)"),
+                             tags$td("Annual size distributions (CCL/SCL per year)"),
+                             tags$td("Tracks time-varying stage selectivity and cohort-specific survival.")
+                           ),
+                           tags$tr(
+                             tags$td("Fixed female ratio (e.g. 0.65)"),
+                             tags$td("Direct sexing (blood hormone / histology)"),
+                             tags$td("Accounts for female-biased operational sex ratios and temperature shifts.")
+                           ),
+                           tags$tr(
+                             tags$td("Total annual take count"),
+                             tags$td("Disaggregated mortality (direct vs. post-release)"),
+                             tags$td("Prevents overestimating mortality when turtles are released alive.")
+                           )
+                         )
+              )
+          )
+      )
+    )
+  )
+}
+
+# =====================================================================
+# THREAT DATA IMPUTATION ENGINE (SAFE RESAMPLING PATCH)
+# =====================================================================
+patch_uploaded_threat_csv <- function(df, intervention_year = 2017, forecast_years = 2026:2075,
+                                      regime = c("post", "pre"),
+                                      sex_strategy_pre = "single", sex_strategy_post = "resample",
+                                      size_strategy_pre = "single", size_strategy_post = "resample",
+                                      count_strategy_pre = "resample", count_strategy_post = "resample") {
+  req(df)
+  regime <- match.arg(regime)
+  
+  # Safe sampling helper to prevent sample.int crashes
+  safe_sample <- function(vec, size, default_val) {
+    vec_clean <- vec[!is.na(vec) & is.finite(vec)]
+    if (length(vec_clean) == 0) {
+      return(rep(default_val, size))
+    }
+    if (length(vec_clean) == 1) {
+      return(rep(vec_clean, size))
+    }
+    sample(vec_clean, size = size, replace = TRUE)
+  }
+  
+  get_col_vec <- function(data_frame, pattern, default_val = NA) {
+    clean_names <- tolower(trimws(names(data_frame)))
+    match_idx <- which(grepl(pattern, clean_names, ignore.case = TRUE))
+    if (length(match_idx) > 0) {
+      return(suppressWarnings(as.numeric(data_frame[[match_idx[1]]])))
+    }
+    return(rep(default_val, nrow(data_frame)))
+  }
+  
+  years_raw    <- as.integer(get_col_vec(df, "^year$", default_val = 2004))
+  turtles_raw  <- get_col_vec(df, "turtle|count|take", default_val = NA_real_)
+  sizes_raw    <- get_col_vec(df, "median|scl|ccl|length|cm", default_val = NA_real_)
+  sex_raw      <- get_col_vec(df, "sex|female|pf|prop", default_val = NA_real_)
+  mort_raw     <- get_col_vec(df, "mort", default_val = 1.0)
+  
+  df_obs <- data.frame(
+    year = years_raw,
+    turtles_raw = turtles_raw,
+    median_cm_raw = sizes_raw,
+    pf_raw = if_else(!is.na(sex_raw) & sex_raw > 1.0, sex_raw / 100, sex_raw),
+    mortality_raw = if_else(is.na(mort_raw), 1.0, mort_raw),
+    stringsAsFactors = FALSE
+  )
+  
+  # Target grid: forecast years (2026-2075)
+  all_target_years <- sort(unique(c(df_obs$year, as.integer(forecast_years))))
+  full_grid <- data.frame(year = all_target_years) %>% left_join(df_obs, by = "year")
+  full_grid$mortality_raw[is.na(full_grid$mortality_raw)] <- 1.0
+  
+  pre_idx  <- full_grid$year < intervention_year
+  post_idx <- full_grid$year >= intervention_year
+  
+  # Isolate pre-2017 and post-2018 observed distributions
+  obs_counts_pre  <- full_grid$turtles_raw[pre_idx & !is.na(full_grid$turtles_raw) & full_grid$turtles_raw > 0]
+  obs_counts_post <- full_grid$turtles_raw[post_idx & !is.na(full_grid$turtles_raw) & full_grid$turtles_raw > 0]
+  
+  obs_sex_pre   <- full_grid$pf_raw[pre_idx & !is.na(full_grid$pf_raw)]
+  obs_sex_post  <- full_grid$pf_raw[post_idx & !is.na(full_grid$pf_raw)]
+  
+  obs_size_pre  <- full_grid$median_cm_raw[pre_idx & !is.na(full_grid$median_cm_raw) & full_grid$median_cm_raw > 0]
+  obs_size_post <- full_grid$median_cm_raw[post_idx & !is.na(full_grid$median_cm_raw) & full_grid$median_cm_raw > 0]
+  
+  val_sex_ref   <- full_grid$pf_raw[full_grid$year == intervention_year & !is.na(full_grid$pf_raw)][1]
+  if (is.null(val_sex_ref) || is.na(val_sex_ref)) val_sex_ref <- 0.73
+  
+  val_size_ref  <- full_grid$median_cm_raw[full_grid$year == intervention_year & !is.na(full_grid$median_cm_raw) & full_grid$median_cm_raw > 0][1]
+  if (is.null(val_size_ref) || is.na(val_size_ref)) val_size_ref <- 150
+  
+  impute_values <- function(vec, idx_mask, strategy, obs_vals, ref_val, default_val) {
+    target_idx <- which(idx_mask & is.na(vec))
+    for (i in target_idx) {
+      if (strategy == "single") {
+        vec[i] <- if (!is.null(ref_val) && !is.na(ref_val)) ref_val else default_val
+      } else if (strategy == "resample") {
+        vec[i] <- if (length(obs_vals) > 0) safe_sample(obs_vals, 1, default_val) else default_val
+      } else {
+        vec[i] <- default_val
+      }
+    }
+    vec
+  }
+  
+  # Impute historical gaps
+  turtles_imputed <- impute_values(full_grid$turtles_raw, pre_idx, count_strategy_pre, obs_counts_pre, mean(obs_counts_pre, na.rm=TRUE), 0)
+  turtles_imputed <- impute_values(turtles_imputed, post_idx, count_strategy_post, obs_counts_post, mean(obs_counts_post, na.rm=TRUE), 0)
+  
+  pf_imputed   <- impute_values(full_grid$pf_raw, pre_idx, sex_strategy_pre, obs_sex_pre, val_sex_ref, 0.73)
+  pf_imputed   <- impute_values(pf_imputed, post_idx, sex_strategy_post, obs_sex_post, val_sex_ref, 0.73)
+  
+  size_imputed <- impute_values(full_grid$median_cm_raw, pre_idx, size_strategy_pre, obs_size_pre, val_size_ref, 150)
+  size_imputed <- impute_values(size_imputed, post_idx, size_strategy_post, obs_size_post, val_size_ref, 150)
+  
+  # Project Future Forecast Years (2026+) based on selected regime
+  future_mask <- full_grid$year >= min(forecast_years)
+  n_future <- sum(future_mask)
+  
+  if (n_future > 0) {
+    if (regime == "pre") {
+      # Extend PRE-2017 Threat Regime into future
+      turtles_imputed[future_mask] <- safe_sample(obs_counts_pre, n_future, default_val = 10)
+      pf_imputed[future_mask]      <- safe_sample(obs_sex_pre, n_future, default_val = 0.73)
+      size_imputed[future_mask]    <- safe_sample(obs_size_pre, n_future, default_val = 150)
+    } else {
+      # Extend POST-2018 Threat Regime into future
+      turtles_imputed[future_mask] <- safe_sample(obs_counts_post, n_future, default_val = 10)
+      pf_imputed[future_mask]      <- safe_sample(obs_sex_post, n_future, default_val = 0.73)
+      size_imputed[future_mask]    <- safe_sample(obs_size_post, n_future, default_val = 150)
+    }
+  }
+  
+  turtles_female <- round(turtles_imputed * pf_imputed)
+  
+  patched_full <- data.frame(
+    year = full_grid$year,
+    turtles = turtles_female,
+    median_cm = round(size_imputed, 1),
+    mortality = full_grid$mortality_raw,
+    pf_applied = round(pf_imputed, 2)
+  )
+  
+  patched_full[patched_full$year %in% forecast_years, , drop = FALSE]
+}
+
 ui <- page_fluid(
   theme=bs_theme(version=5, primary="#185e55", bg="#f8f7f2", fg="#243d3a", base_font="Arial"),
   tags$head(tags$script(HTML("$(document).on('shiny:connected', function(){Shiny.addCustomMessageHandler('biology-details',function(open){document.getElementById('biology_details').open=open;});});")),tags$style(HTML("
@@ -5984,7 +6215,7 @@ ui <- page_fluid(
         )),ux_back_next("ux_back_welcome","← Welcome","go_step3","Continue: your turtles →")
       )),
       nav_panel("Your turtles",value="step3",ux_section("A little about your population.","Nest counts are the starting point. We also need information about growth, breeding, and survival.",
-        selectInput("parameter_preset","Population information",c("Choose a profile or enter my own values"="custom","Western Pacific leatherback — reference profile"="wp_leatherback"),selected="custom",width="100%"),
+        selectInput("parameter_preset", "Population information", choices = c("Choose a profile or enter my own values" = "custom", "Western Pacific leatherback — reference profile" = "wp_leatherback", "North Pacific loggerhead — reference profile" = "np_loggerhead"), selected = "custom", width = "100%"),
         uiOutput("ux_biology_status"),
         p(class="ux-muted","Reference: Martin 2020 / Siders 2023. Use only if appropriate for your population."),
         tags$details(id="biology_details",tags$summary("Review or edit growth, breeding & survival"),
@@ -6034,7 +6265,9 @@ ui <- page_fluid(
         checkboxGroupInput("ux_compare_ids","Options to include",choices=character(0)),uiOutput("ux_comparison_review"),
         div(class="ux-actions",actionButton("ux_run_comparison","Run comparison",class="btn-primary"),actionButton("ux_back_scenarios","Edit options",class="btn-outline-secondary")),
         uiOutput("ux_result_status"),uiOutput("dev_comparison_health"),checkboxInput("show_proj_ci","Show the range of possible outcomes",TRUE),
-        plotOutput("step5_dynamic_plot",height="380px"),tableOutput("ux_comparison_table"),
+        plotOutput("step5_dynamic_plot", height="380px"),
+        ux_caveats_monitoring_ui(),  # <-- Added callout card
+        tableOutput("ux_comparison_table"),
         p(class="ux-muted","Forecasts describe annual nesting females. The 50% benchmark is not a species-specific extinction threshold."),
         div(class="ux-actions",downloadButton("download_projection_plot","Download chart"),downloadButton("download_projection_summary","Download results CSV"),downloadButton("ux_download_settings","Download settings")),
         dev_only(downloadButton("download_projection_draws","Download simulation CSV"),tags$details(tags$summary("Mathematical checks"),p("Equation and timing checks do not validate empirical assumptions."),actionButton("run_math_self_checks","Run mathematical checks"),div(class="ux-scroll",tableOutput("math_self_check_table")))),
@@ -6226,7 +6459,190 @@ server <- function(input, output, session) {
   observeEvent(input$ux_nav, { ux_go(input$ux_nav) })
   observeEvent(input$ux_go_results, { ux_go("results") })
   observeEvent(input$ux_back_scenarios, { ux_go("step5") })
-  observeEvent(input$threat_csv, { ux$loaded_threat <- NULL }, ignoreInit = TRUE)
+  # --- INTERACTIVE THREAT CSV UPLOAD & GAP WIZARD ---
+  observeEvent(input$threat_csv, {
+    req(input$threat_csv)
+    raw_df <- read.csv(input$threat_csv$datapath, check.names = FALSE)
+    
+    clean_names <- tolower(trimws(names(raw_df)))
+    find_col_idx <- function(pat) { match <- which(grepl(pat, clean_names)); if (length(match) > 0) match[1] else NA }
+    
+    year_idx   <- find_col_idx("^year$") %||% 1
+    turtle_idx <- find_col_idx("turtle|count|take")
+    size_idx   <- find_col_idx("median|scl|ccl|length|cm")
+    sex_idx    <- find_col_idx("sex|female|pf|prop")
+    
+    years <- suppressWarnings(as.integer(raw_df[[year_idx]]))
+    intervention_yr <- 2017
+    
+    pre_idx  <- years < intervention_yr
+    post_idx <- years >= intervention_yr
+    
+    sex_vals  <- if (!is.na(sex_idx)) raw_df[[sex_idx]] else rep(NA, nrow(raw_df))
+    size_vals <- if (!is.na(size_idx)) raw_df[[size_idx]] else rep(NA, nrow(raw_df))
+    
+    missing_sex_pre   <- sum(pre_idx & (is.na(sex_vals) | trimws(as.character(sex_vals)) == ""))
+    missing_sex_post  <- sum(post_idx & (is.na(sex_vals) | trimws(as.character(sex_vals)) == ""))
+    missing_size_pre  <- sum(pre_idx & (is.na(size_vals) | trimws(as.character(size_vals)) == ""))
+    missing_size_post <- sum(post_idx & (is.na(size_vals) | trimws(as.character(size_vals)) == ""))
+    
+    ux$temp_raw_threat <- raw_df
+    
+    if (missing_sex_pre > 0 || missing_sex_post > 0 || missing_size_pre > 0 || missing_size_post > 0) {
+      showModal(modalDialog(
+        title = tags$div(shiny::icon("triangle-exclamation", class = "text-warning me-2"), "Patchy Threat Data Wizard"),
+        easyClose = FALSE, size = "l",
+        
+        div(class = "alert alert-info p-3 mb-3",
+            tags$b("Dataset Summary: "),
+            sprintf("Uploaded %d rows. Intervention boundary set to year %d.", nrow(raw_df), intervention_yr)
+        ),
+        
+        fluidRow(
+          column(6,
+                 div(class = "p-3 border rounded bg-light mb-3",
+                     h6(tags$b("1. Sex Ratio Strategy (pf)")),
+                     p(style = "font-size: 0.85rem; color: #555;",
+                       sprintf("Missing sex data: %d years pre-%d, %d years post-%d.", missing_sex_pre, intervention_yr, missing_sex_post, intervention_yr)
+                     ),
+                     radioButtons("wizard_sex_pre", "Pre-intervention sex strategy:",
+                                  choices = c("Apply single 2017 value" = "single", "Random draw from pre-intervention years" = "resample", "Use default baseline (0.73)" = "baseline"), selected = "single"),
+                     radioButtons("wizard_sex_post", "Post-intervention & future strategy:",
+                                  choices = c("Random draw from post-intervention years (Siders method)" = "resample", "Apply single 2017 value" = "single"), selected = "resample")
+                 )
+          ),
+          column(6,
+                 div(class = "p-3 border rounded bg-light mb-3",
+                     h6(tags$b("2. Carapace Length Strategy (median_cm)")),
+                     p(style = "font-size: 0.85rem; color: #555;",
+                       sprintf("Missing size data: %d years pre-%d, %d years post-%d.", missing_size_pre, intervention_yr, missing_size_post, intervention_yr)
+                     ),
+                     radioButtons("wizard_size_pre", "Pre-intervention size strategy:",
+                                  choices = c("Apply single 2017 SCL value" = "single", "Random draw from observed sizes" = "resample"), selected = "single"),
+                     radioButtons("wizard_size_post", "Post-intervention & future strategy:",
+                                  choices = c("Random draw from post-intervention sizes (Siders method)" = "resample", "Apply single 2017 SCL value" = "single"), selected = "resample")
+                 )
+          )
+        ),
+        
+        footer = tagList(
+          modalButton("Cancel"),
+          actionButton("confirm_wizard_patch", "Apply Imputation & Load Schedule", class = "btn-primary")
+        )
+      ))
+    } else {
+      patched <- patch_uploaded_threat_csv(raw_df, intervention_year = 2017)
+      ux$loaded_threat <- list(data = patched, file = input$threat_csv)
+      showNotification("Threat schedule loaded successfully!", type = "message")
+    }
+  })
+  
+  # --- CONFIRM WIZARD IMPUTATION (CREATES SIDE-BY-SIDE PRE vs POST SCENARIOS) ---
+  observeEvent(input$confirm_wizard_patch, {
+    req(ux$temp_raw_threat)
+    forecast_yrs <- ux_forecast_years()
+    
+    # 1. Generate PRE-2017 Extended Threat Schedule (Counterfactual)
+    df_pre <- patch_uploaded_threat_csv(
+      df = ux$temp_raw_threat, intervention_year = 2017, forecast_years = forecast_yrs,
+      regime = "pre",
+      sex_strategy_pre = input$wizard_sex_pre, sex_strategy_post = input$wizard_sex_post,
+      size_strategy_pre = input$wizard_size_pre, size_strategy_post = input$wizard_size_post
+    )
+    
+    # 2. Generate POST-2018 Extended Threat Schedule (Reduced Take)
+    df_post <- patch_uploaded_threat_csv(
+      df = ux$temp_raw_threat, intervention_year = 2017, forecast_years = forecast_yrs,
+      regime = "post",
+      sex_strategy_pre = input$wizard_sex_pre, sex_strategy_post = input$wizard_sex_post,
+      size_strategy_pre = input$wizard_size_pre, size_strategy_post = input$wizard_size_post
+    )
+    
+    # Store primary active schedule in editor
+    ux$loaded_threat <- list(data = df_post, file = input$threat_csv)
+    
+    # Automatically register both scenarios for side-by-side PVA comparison
+    scen_pre_id  <- "scen_pre_2017_extended"
+    scen_post_id <- "scen_post_2018_extended"
+    
+    base_values <- list(
+      pva_mode = "mode_threat",
+      threat_input_type = "table",
+      siders_fishery_center_mode = "direct",
+      siders_force_all_fatal = FALSE
+    )
+    
+    ux$scenarios[[scen_pre_id]] <- list(
+      id = scen_pre_id,
+      name = "Pre-2017 Take Extended (Counterfactual)",
+      values = modifyList(base_values, list(ux_threat_data = df_pre)),
+      saved_at = Sys.time()
+    )
+    
+    ux$scenarios[[scen_post_id]] <- list(
+      id = scen_post_id,
+      name = "Post-2018 Take Extended (Reduced)",
+      values = modifyList(base_values, list(ux_threat_data = df_post)),
+      saved_at = Sys.time()
+    )
+    
+    # Select both scenarios for side-by-side plot rendering
+    choices <- setNames(names(ux$scenarios), vapply(ux$scenarios, `[[`, character(1), "name"))
+    updateCheckboxGroupInput(session, "ux_compare_ids", choices = choices, selected = c(scen_pre_id, scen_post_id))
+    
+    removeModal()
+    showNotification("Created side-by-side scenarios: Pre-2017 Extended vs. Post-2018 Extended!", type = "message", duration = 8)
+  })
+  
+  # --- FIX FOR SETNAMES NULL UI CRASH ---
+  output$dev_fit_selector <- renderUI({
+    choices <- names(dev_fit_choices())
+    req(!is.null(choices), length(choices) > 0) # Safe NULL guard
+    selectInput("dev_fit_choice", "Fit to inspect",
+                setNames(choices, sub("^regional$", "Active regional trend", choices)),
+                selected = isolate(input$dev_fit_choice) %||% "regional", width = "100%")
+  })
+  
+  # --- REACTIVE BUILDER SCHEDULE GENERATOR ---
+  builder_schedule_df <- reactive({
+    req(input$builder_start_year, input$builder_end_year, input$builder_reduction_year)
+    
+    start_yr <- as.integer(input$builder_start_year)
+    end_yr <- as.integer(input$builder_end_year)
+    reduct_yr <- as.integer(input$builder_reduction_year)
+    
+    validate(need(end_yr >= start_yr, "End year must be greater than or equal to start year."))
+    
+    years <- seq(start_yr, end_yr)
+    turtles <- ifelse(years < reduct_yr, input$builder_baseline_take, input$builder_reduced_take)
+    
+    # Adjust turtle counts by female proportion input if required
+    effective_turtles <- round(turtles * (input$builder_female_prop %||% 1.0))
+    
+    data.frame(
+      year = years,
+      turtles = effective_turtles,
+      median_cm = input$builder_mean_cm %||% 65,
+      mortality = input$builder_mortality %||% 0.35
+    )
+  })
+  
+  # --- APPLY BUILDER DATA TO THREAT DATASET ---
+  observeEvent(input$apply_builder_schedule, {
+    df <- builder_schedule_df()
+    ux$loaded_threat <- list(data = df, file = NULL)
+    showNotification("Generated annual threat schedule applied to scenario!", type = "message")
+  })
+  
+  # --- DOWNLOAD BUILDER TEMPLATE CSV ---
+  output$download_builder_csv <- downloadHandler(
+    filename = function() {
+      paste0("threat_schedule_template_", format(Sys.Date(), "%Y%m%d"), ".csv")
+    },
+    content = function(file) {
+      write.csv(builder_schedule_df(), file, row.names = FALSE)
+    }
+  )
   for (kind in c("nests", "yearlings", "adults")) local({
     k <- kind
     observeEvent(input[[paste0("action_csv_", k)]], {
@@ -6307,7 +6723,12 @@ server <- function(input, output, session) {
         if (identical(user_state$data_mode, "demo")) p("Synthetic demonstration data."))
   })
   ux_reference_values <- reactive({
-    if (identical(input$parameter_preset, "wp_leatherback")) return(c(clutch_freq=5.5, remig_int=3.06, linf=142.7, k=.2262, tknot=-.17, lmat=139.1325, sig_mat=6.3399, pf=.73, ane_pj=.81, ane_pa=.893))
+    if (identical(input$parameter_preset, "wp_leatherback")) {
+      return(c(clutch_freq=5.5, remig_int=3.06, linf=142.7, k=.2262, tknot=-.17, lmat=139.1325, sig_mat=6.3399, pf=.73, ane_pj=.81, ane_pa=.893))
+    }
+    if (identical(input$parameter_preset, "np_loggerhead")) {
+      return(c(clutch_freq=4.6, remig_int=3.3, linf=92.5, k=0.095, tknot=-1.80, lmat=83.0, sig_mat=4.0, pf=0.65, ane_pj=0.80, ane_pa=0.89))
+    }
     numeric(0)
   })
   output$ux_biology_status <- renderUI({
@@ -6343,7 +6764,7 @@ server <- function(input, output, session) {
     keys <- grep(pattern, names(all), value = TRUE)
     v <- all[keys]; v <- v[!grepl("^action_csv", names(v))]
     v <- modifyList(v, ux_shared_values())
-    if (identical(v$pva_mode, "mode_threat") && identical(v$threat_input_type, "table")) {
+    if (identical(v$pva_mode, "mode_threat") && v$threat_input_type %in% c("table", "builder")) {
       loaded <- ux$loaded_threat
       if (!is.null(loaded)) {v$ux_threat_data <- loaded$data; v$threat_csv <- loaded$file}
       else if (!is.null(input$threat_csv)) {v$ux_threat_data <- read.csv(input$threat_csv$datapath, check.names = FALSE); v$threat_csv <- input$threat_csv}
@@ -6871,18 +7292,39 @@ server <- function(input, output, session) {
     
     # ---------------------------------------------------------------
     # NORTH PACIFIC LOGGERHEAD
-    # Hold for one small lineage correction before activating.
+    # Martin et al. 2020 / Siders et al. 2023 lineage
     # ---------------------------------------------------------------
     if (identical(preset, "np_loggerhead")) {
       
+      updateNumericInput(session, "clutch_freq", value = 4.6)
+      updateNumericInput(session, "remig_int",  value = 3.3)
+      updateNumericInput(session, "linf",       value = 92.5)
+      updateNumericInput(session, "k",          value = 0.095)
+      updateNumericInput(session, "tknot",      value = -1.80)
+      updateNumericInput(session, "lmat",       value = 83.0)
+      updateNumericInput(session, "sig_mat",    value = 4.0)
+      updateNumericInput(session, "pf",         value = 0.65)
+      updateNumericInput(session, "ane_pj",     value = 0.80)
+      updateNumericInput(session, "ane_pa",     value = 0.89)
+      
+      # Optional: Update Conservation Action defaults if present
+      if (!is.null(input$override_eggs)) {
+        updateNumericInput(session, "override_eggs", value = 118)
+      }
+      if (!is.null(input$action_protected_hatch)) {
+        updateNumericInput(session, "action_protected_hatch", value = 0.70)
+      }
+      if (!is.null(input$action_protected_emergence)) {
+        updateNumericInput(session, "action_protected_emergence", value = 0.80)
+      }
+      if (!is.null(input$override_syr1)) {
+        updateNumericInput(session, "override_syr1", value = 0.08)
+      }
+      
       showNotification(
-        paste(
-          "North Pacific loggerhead preset is not yet activated.",
-          "We first need to separate nest-count conversion clutch frequency",
-          "from reproductive clutch frequency to retain Martin lineage fidelity."
-        ),
-        type = "warning",
-        duration = 8
+        "North Pacific loggerhead reference parameters loaded.",
+        type = "message",
+        duration = 4
       )
     }
     
