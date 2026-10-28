@@ -34,19 +34,191 @@ library(ggplot2)
 library(purrr)
 library(mvtnorm)
 library(truncnorm)
-library(jagsUI)
+library(cmdstanr)
+library(posterior)
+library(coda)
 library(MARSS)
+
+# =====================================================================
+# STAN MODEL DEFINITIONS & CMDSTANR CACHE 
+# =====================================================================
+FOURIER_STAN_SRC <- '
+data {
+  int<lower=1> n_steps;
+  int<lower=1> n_months;
+  int<lower=1> n_timeseries;
+  int<lower=1> n_years;
+  array[n_steps] int<lower=1, upper=12> m;
+  matrix[n_steps, n_timeseries] y;
+  vector<lower=0>[n_timeseries] period_mean;
+  vector<lower=0>[n_timeseries] period_sd;
+  real<lower=0> cf_mean;
+  real<lower=0> cf_sd;
+  real<lower=0> beta_sd;
+  real<lower=0> sigma_shape;
+  real<lower=0> sigma_rate;
+}
+parameters {
+  matrix[n_steps, n_timeseries] z_X;
+  vector[n_timeseries] beta_cos;
+  vector[n_timeseries] beta_sin;
+  vector<lower=4, upper=24>[n_timeseries] period;
+  real<lower=1e-6, upper=30> sigma_X;
+  real<lower=1e-6, upper=30> sigma_y;
+  real<lower=0> cf;
+}
+transformed parameters {
+  matrix[n_steps, n_timeseries] X;
+  matrix[n_steps, n_timeseries] baseline;
+  for (j in 1:n_timeseries) {
+    baseline[1, j] = 10.0 * z_X[1, j];
+    for (t in 2:n_steps) {
+      baseline[t, j] = baseline[t - 1, j] + sigma_X * z_X[t, j];
+    }
+    for (t in 1:n_steps) {
+      real angle = 2.0 * pi() * t / period[j];
+      X[t, j] = baseline[t, j] + beta_cos[j] * cos(angle) + beta_sin[j] * sin(angle);
+    }
+  }
+}
+model {
+  period ~ normal(period_mean, period_sd);
+  beta_cos ~ normal(0, beta_sd);
+  beta_sin ~ normal(0, beta_sd);
+  to_vector(z_X) ~ std_normal();
+  sigma_X ~ gamma(sigma_shape, sigma_rate);
+  sigma_y ~ gamma(sigma_shape, sigma_rate);
+  cf ~ normal(cf_mean, cf_sd);
+
+  for (j in 1:n_timeseries) {
+    for (t in 1:n_steps) {
+      if (y[t, j] > -900) y[t, j] ~ normal(X[t, j], sigma_y);
+    }
+  }
+}
+generated quantities {
+  matrix[n_years, n_timeseries] N_nesters;
+  for (j in 1:n_timeseries) {
+    for (t in 1:n_years) {
+      real sum_nests = 0;
+      for (mm in 1:12) sum_nests += exp(X[(t - 1) * 12 + mm, j]);
+      N_nesters[t, j] = log(fmax(1e-9, sum_nests / cf));
+    }
+  }
+}
+'
+
+TREND_STAN_SRC <- '
+data {
+  int<lower=2> n_years;
+  int<lower=1> n_timeseries;
+  matrix[n_timeseries, n_years] Y;
+  matrix<lower=0>[n_timeseries, n_years] Y_se;
+  real N0_mean;
+  int<lower=0, upper=1> trend_prior_mode;
+  real<lower=0> sigma_proc_scale;
+  real<lower=0> sigma_obs_scale;
+  real<lower=0> sigma_proc_upper;
+  real<lower=0> sigma_obs_upper;
+}
+parameters {
+  real<lower=-3, upper=3> r;
+  real<lower=1e-6, upper=sigma_proc_upper> sigma_proc;
+  vector<lower=1e-6>[n_timeseries] sigma_obs;
+  real<lower=-50, upper=50> N0;
+  vector<lower=-10, upper=10>[n_years - 1] z_proc;
+  vector[n_timeseries - 1] a_raw;
+}
+transformed parameters {
+  vector[n_years] N_true;
+  vector[n_timeseries] A;
+  A[1] = 0.0;
+  if (n_timeseries > 1) {
+    for (j in 2:n_timeseries) {
+      A[j] = a_raw[j - 1];
+    }
+  }
+  N_true[1] = N0;
+  for (t in 2:n_years) {
+    N_true[t] = N_true[t - 1] + r + sigma_proc * z_proc[t - 1];
+  }
+}
+model {
+  r ~ normal(0, 0.5);
+  if (n_timeseries > 1) {
+    a_raw ~ normal(0, 4.0);
+  }
+  if (trend_prior_mode == 0) {
+    sigma_proc ~ normal(0, sigma_proc_scale);
+    sigma_obs ~ normal(0, sigma_obs_scale);
+  } else {
+    real log_tau_proc = -2.0 * log(sigma_proc);
+    target += 0.01 * log(0.01) - lgamma(0.01) - 0.01 * log_tau_proc - 0.01 * exp(log_tau_proc) + log(2.0) - 3.0 * log(sigma_proc);
+    for (j in 1:n_timeseries) {
+      real log_tau_obs = -2.0 * log(sigma_obs[j]);
+      target += 0.01 * log(0.01) - lgamma(0.01) - 0.01 * log_tau_obs - 0.01 * exp(log_tau_obs) + log(2.0) - 3.0 * log(sigma_obs[j]);
+    }
+  }
+  N0 ~ normal(N0_mean, 10);
+  z_proc ~ std_normal();
+  for (j in 1:n_timeseries) {
+    for (t in 1:n_years) {
+      if (Y[j, t] > -900) {
+        Y[j, t] ~ normal(N_true[t] + A[j], sqrt(square(sigma_obs[j]) + square(Y_se[j, t])));
+      }
+    }
+  }
+}
+'
+
+.stan_models_env <- new.env(parent = emptyenv())
+get_fourier_model <- function() {
+  if (is.null(.stan_models_env$fourier)) {
+    f_path <- file.path(tempdir(), "fourier_imputation.stan")
+    writeLines(FOURIER_STAN_SRC, f_path, useBytes = TRUE)
+    .stan_models_env$fourier <- cmdstanr::cmdstan_model(f_path, quiet = TRUE)
+  }
+  .stan_models_env$fourier
+}
+
+get_trend_model <- function() {
+  if (is.null(.stan_models_env$trend)) {
+    t_path <- file.path(tempdir(), "annual_nester_trend.stan")
+    writeLines(TREND_STAN_SRC, t_path, useBytes = TRUE)
+    .stan_models_env$trend <- cmdstanr::cmdstan_model(t_path, quiet = TRUE)
+  }
+  .stan_models_env$trend
+}
+
+# Helper: Convert CmdStan draws array [iter, chain, var] to coda::mcmc.list
+stan_draws_to_mcmc_list <- function(draws) {
+  arr <- as.array(draws)
+  n_chains <- dim(arr)[2]
+  n_vars <- dim(arr)[3]
+  var_names <- dimnames(arr)[[3]]
+  chain_list <- lapply(seq_len(n_chains), function(ci) {
+    mat <- matrix(arr[, ci, ], nrow = dim(arr)[1], ncol = n_vars)
+    colnames(mat) <- var_names
+    coda::mcmc(mat, start = 1, thin = 1)
+  })
+  coda::mcmc.list(chain_list)
+}
 
 # =====================================================================
 # MATHEMATICAL HELPERS & DISTRIBUTIONS
 # =====================================================================
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
-inv_logit <- function(x) { exp(x) / (1 + exp(x)) }
-safe_logit <- function(x) {
-  if (any(!is.finite(x)) || any(x < 0 | x > 1)) stop("Invalid probability.")
-  qlogis(pmax(.Machine$double.eps, pmin(1 - .Machine$double.eps, x)))
+# Round a quota upward to the next whole action unit while preventing
+# floating-point noise around an exact integer (e.g. 20.000000000000004) from creating
+# an unnecessary extra unit.
+round_up_quota <- function(x, rel_tol = 1e-10) {
+  nearest <- round(x)
+  near_integer <- abs(x - nearest) <= rel_tol * pmax(1, abs(x))
+  ceiling(ifelse(near_integer, nearest, x))
 }
+
+inv_logit <- function(x) { exp(x) / (1 + exp(x)) }
 
 compute_CMP_constant <- function(Lambda, Nu, Mu, Tol, Max, Log=TRUE, Type="Z"){
   if( (!is.na(Lambda) & Lambda > 10^Nu) | (!is.na(Mu) & Mu^Nu > 10^Nu) ){
@@ -270,20 +442,20 @@ validate_log_count_input <- function(count, monitored = NULL,
 }
 
 # =====================================================================
-# FOURIER IMPUTATION ENGINE -- Methods 2.2, Eqs. 1-3
-# Includes y[1] in single- and multi-site likelihoods; annual N is log(sum(exp(X))).
+# FOURIER IMPUTATION ENGINE (STAN CMDSTANR IMPLEMENTATION)
 # =====================================================================
 run_fourier_imputation <- function(
     df, iter = 100000, six_month_sites = NULL,
-    legacy_mcmc = FALSE, season_start_month = 4L) {
-
+    legacy_mcmc = FALSE, season_start_month = 4L,
+    clutch_frequency = 5.5, clutch_frequency_sd = 1.6) {
+  
   df <- normalise_monitoring_status(df)
   validate_log_count_input(
     count = df$Count,
     monitored = df$Monitored,
     label = "monthly nest-count"
   )
-
+  
   df_clean <- df %>%
     add_nesting_season(
       season_start_month = season_start_month
@@ -295,206 +467,119 @@ run_fourier_imputation <- function(
     ) %>%
     group_by(Season, Seq_Month, Site) %>%
     summarise(
-      Count = if (all(is.na(Count))) {
-        NA_real_
-      } else {
-        sum(Count, na.rm = TRUE)
-      },
+      Count = if (all(is.na(Count))) NA_real_ else sum(Count, na.rm = TRUE),
       .groups = "drop"
     )
-
+  
   if (nrow(df_clean) == 0L) {
     stop("No valid monthly observations remain after nesting-season assignment.")
   }
-
-  all_seasons <- seq.int(
-    min(df_clean$Season, na.rm = TRUE),
-    max(df_clean$Season, na.rm = TRUE)
-  )
+  
+  all_seasons <- seq.int(min(df_clean$Season, na.rm = TRUE), max(df_clean$Season, na.rm = TRUE))
   sites <- sort(unique(df_clean$Site))
   n_years <- length(all_seasons)
   n_timeseries <- length(sites)
-
-  full_grid <- expand.grid(
-    Seq_Month = 1:12,
-    Season = all_seasons,
-    Site = sites,
-    stringsAsFactors = FALSE
-  )
+  
+  full_grid <- expand.grid(Seq_Month = 1:12, Season = all_seasons, Site = sites, stringsAsFactors = FALSE)
   prep_df <- full_grid %>%
-    left_join(
-      df_clean,
-      by = c("Season", "Seq_Month", "Site")
-    ) %>%
+    left_join(df_clean, by = c("Season", "Seq_Month", "Site")) %>%
     arrange(Season, Seq_Month) %>%
-    pivot_wider(
-      names_from = Site,
-      values_from = Count
-    ) %>%
+    pivot_wider(names_from = Site, values_from = Count) %>%
     select(all_of(sites))
-
+  
   y_matrix <- as.matrix(prep_df)
   y_matrix[is.nan(y_matrix) | is.infinite(y_matrix)] <- NA
   if (any(y_matrix <= 0, na.rm = TRUE)) {
-    stop(
-      "Internal validation failure: non-positive monthly counts reached the ",
-      "Gaussian log-count imputation model."
-    )
+    stop("Internal validation failure: non-positive monthly counts reached the Gaussian log-count model.")
   }
   y_matrix <- log(y_matrix)
   y_matrix <- matrix(y_matrix, ncol = n_timeseries)
+  y_matrix[is.na(y_matrix)] <- -999.0
   
-  periods <- rep(12, n_timeseries)
-  for(i in 1:n_timeseries) { 
-    if(sites[i] %in% six_month_sites) periods[i] <- 6 
+  periods <- rep(12.0, n_timeseries)
+  for (i in seq_len(n_timeseries)) { 
+    if (sites[i] %in% six_month_sites) periods[i] <- 6.0 
   }
   
-  jags_data <- list(m = rep(1:12, times = n_years), n.steps = nrow(y_matrix), n.months = 12, pi = pi, period = periods, n.timeseries = n_timeseries, n.years = n_years)
+  stan_data <- list(
+    n_steps = nrow(y_matrix),
+    n_months = 12L,
+    n_timeseries = n_timeseries,
+    n_years = n_years,
+    m = as.integer(rep(1:12, times = n_years)),
+    y = y_matrix,
+    period_mean = as.numeric(periods),
+    period_sd = rep(2.0, n_timeseries),
+    cf_mean = as.numeric(clutch_frequency),
+    cf_sd = as.numeric(clutch_frequency_sd),
+    beta_sd = 1.0,
+    sigma_shape = 2.0,
+    sigma_rate = 0.5
+  )
   
-  if (n_timeseries == 1) {
-    jags_data$y <- as.vector(y_matrix)
-    
-    # The single-site JAGS model does not use this variable.
-    jags_data$n.timeseries <- NULL
-    
-    model_string <- "
-    model {
-      X[1] ~ dnorm(0, 0.01)
-      y[1] ~ dnorm(X[1], tau.y)
-      for (t in 2:n.steps){
-         predX[t] <- c[m[t]] + X[t-1]
-         X[t] ~ dnorm(predX[t], tau.X)
-         y[t] ~ dnorm(X[t], tau.y)
-      }
-      for (y_idx in 1:n.years){
-         for (mm in 1:12){ tmp2[y_idx, mm] <- exp(X[(y_idx*12 - mm + 1)]) }
-         N[y_idx] <- log(sum(tmp2[y_idx, ]))
-      }
-      for (k in 1:n.months){
-          c.const[k] <- 2 * pi * k / period[1]
-          c[k] <- beta.cos * cos(c.const[k]) + beta.sin * sin(c.const[k])
-      }
-      sigma.y ~ dgamma(2, 0.5); tau.y <- 1/(sigma.y * sigma.y)
-      beta.cos ~ dnorm(0, 1); beta.sin ~ dnorm(0, 1)
-      sigma.X ~ dgamma(2, 0.5); tau.X <- 1/(sigma.X * sigma.X)
-    }"
-  } else {
-    jags_data$y <- y_matrix
-    # Integration-test repair: one closing brace ends this JAGS model.
-    # The prior string had an extra brace; all model equations are retained.
-    model_string <- "
-    model {
-      for(j in 1:n.timeseries) {
-         X[1,j] ~ dnorm(0, 0.01)
-         # Methods 2.2: condition on the first monitored month as well.
-         y[1,j] ~ dnorm(X[1,j], tau.y)
-         for (t in 2:n.steps){
-             predX[t,j] <-  c[j,m[t]] + X[t-1, j]
-             X[t,j] ~ dnorm(predX[t,j], tau.X)
-             y[t,j] ~ dnorm(X[t,j], tau.y)
-         }
-         for (y_idx in 1:n.years){
-            for (mm in 1:12){ tmp2[y_idx, mm, j] <- exp(X[(y_idx*12 - mm + 1), j]) }
-            N[y_idx, j] <- log(sum(tmp2[y_idx, , j]))
-         }
-      }
-        for (j in 1:n.timeseries){
-           for (k in 1:n.months){
-              c.const[j,k] <- 2 * pi * k / period[j]
-              c[j,k] <- beta.cos[j] * cos(c.const[j,k]) +
-                        beta.sin[j] * sin(c.const[j,k])
-           }
-        
-           beta.cos[j] ~ dnorm(0, 1)
-           beta.sin[j] ~ dnorm(0, 1)
-        }
-        
-        sigma.y ~ dgamma(2, 0.5)
-        tau.y <- 1/(sigma.y * sigma.y)
-        
-        sigma.X ~ dgamma(2, 0.5)
-        tau.X <- 1/(sigma.X * sigma.X)
-    }"
-  }
-  
-  # The supplied Martin/Siders implementation used five chains, 100,000
-  # iterations, a 50,000-iteration burn-in, thinning by five, and parallel
-  # chains. The fast setting retains the same model equations but is intended
-  # only for interactive exploration.
+  # Exploration vs Reference sampling settings
   if (isTRUE(legacy_mcmc)) {
-    n_chains <- 5
-    n_iter <- max(100000, iter)
-    n_burnin <- 50000
-    n_thin <- 5
-    run_parallel <- TRUE
+    n_chains <- 4L; iter_warmup <- 1000L; iter_sampling <- 1000L
   } else {
-    n_chains <- 3
-    n_iter <- max(2000, iter)
-    n_burnin <- floor(n_iter / 3)
-    n_thin <- 5
-    run_parallel <- FALSE
+    n_chains <- 2L; iter_warmup <- 250L; iter_sampling <- 250L
   }
-
-  # Parallel JAGS workers cannot safely receive a textConnection.
-  # Write the model to a temporary file that every worker can open.
   
-  model_file <- tempfile(
-    pattern = "fourier_model_",
-    fileext = ".bug"
+  mod_fourier <- get_fourier_model()
+  fit_imp <- mod_fourier$sample(
+    data = stan_data,
+    chains = n_chains,
+    parallel_chains = n_chains,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    thin = 1,
+    adapt_delta = 0.99,
+    max_treedepth = 14,
+    refresh = 0,
+    show_messages = FALSE
   )
   
-  writeLines(
-    model_string,
-    con = model_file
-  )
-  
-  on.exit(
-    unlink(model_file),
-    add = TRUE
-  )
-  
-  jm <- jagsUI::jags(
-    data = jags_data,
-    parameters.to.save = c("N", "beta.cos", "beta.sin", "sigma.X", "sigma.y"),
-    model.file = model_file,
-    n.chains = n_chains,
-    n.iter = n_iter,
-    n.burnin = n_burnin,
-    n.thin = n_thin,
-    parallel = run_parallel,
-    verbose = FALSE
-  )
-  
-  jm$dev_record <- list(model=model_string, data=jags_data,
-    sampling=list(chains=n_chains, iterations=n_iter, burnin=n_burnin, thin=n_thin, parallel=run_parallel),
-    mode=if(legacy_mcmc) "Reference settings" else "Exploration settings",
-    seed_note="JAGS initialization was automatic; chains and model data are exported, but exact replay seed is not retained.",
-    app_version="guided-developer-2026-09-02")
-  as_site_matrix <- function(x) {
-    if (n_timeseries == 1) matrix(as.numeric(x), ncol = 1) else as.matrix(x)
-  }
-  n_median <- as_site_matrix(jm$q50$N)
-  n_lower <- as_site_matrix(jm$q2.5$N)
-  n_upper <- as_site_matrix(jm$q97.5$N)
+  x_mat <- posterior::as_draws_matrix(fit_imp$draws("X"))
+  nester_mat <- posterior::as_draws_matrix(fit_imp$draws("N_nesters"))
   
   d_annual_list <- list()
-  for (i in 1:n_timeseries) {
-    d_annual_list[[i]] <- data.frame(
+  for (j in seq_len(n_timeseries)) {
+    site_annual_nests <- sapply(seq_len(n_years), function(t) {
+      idx_cols <- sprintf("X[%d,%d]", ((t - 1L) * 12L + 1L):(t * 12L), j)
+      rowSums(exp(x_mat[, idx_cols, drop = FALSE]))
+    })
+    if (is.null(dim(site_annual_nests))) site_annual_nests <- matrix(site_annual_nests, ncol = 1L)
+    
+    nester_cols <- sprintf("N_nesters[%d,%d]", seq_len(n_years), j)
+    site_nester_draws <- nester_mat[, nester_cols, drop = FALSE]
+    
+    d_annual_list[[j]] <- data.frame(
       Year = all_seasons,
-      Site = sites[i],
-      Count = exp(n_median[, i]),
-      Count_Lower_95 = exp(n_lower[, i]),
-      Count_Upper_95 = exp(n_upper[, i]),
-      Season_Start_Month = as.integer(season_start_month)
+      Site = sites[j],
+      Count = apply(site_annual_nests, 2, median),
+      Count_Lower_95 = apply(site_annual_nests, 2, quantile, probs = 0.025),
+      Count_Upper_95 = apply(site_annual_nests, 2, quantile, probs = 0.975),
+      Season_Start_Month = as.integer(season_start_month),
+      Log_Nester_Median = apply(site_nester_draws, 2, median),
+      Log_Nester_SE = apply(site_nester_draws, 2, sd),
+      stringsAsFactors = FALSE
     )
   }
+  
   res_annual <- do.call(rbind, d_annual_list)
-  attr(res_annual, "mcmc_mode") <- if (legacy_mcmc) {
-    "Martin/Siders settings"
-  } else {
-    "Interactive fast settings"
-  }
-  attr(res_annual, "dev_fit") <- jm
+  attr(res_annual, "mcmc_mode") <- if (legacy_mcmc) "Stan reference settings" else "Stan fast settings"
+  
+  dev_fit <- list(
+    cmdstan_fit = fit_imp,
+    samples = stan_draws_to_mcmc_list(fit_imp$draws(c("sigma_X", "sigma_y", "beta_cos", "beta_sin", "period"))),
+    summary = as.data.frame(fit_imp$summary()),
+    dev_record = list(
+      model = FOURIER_STAN_SRC,
+      sampling = list(chains = n_chains, warmup = iter_warmup, sampling = iter_sampling),
+      mode = if (legacy_mcmc) "Reference settings (Stan)" else "Exploration settings (Stan)",
+      app_version = "guided-stan-2026"
+    )
+  )
+  attr(res_annual, "dev_fit") <- dev_fit
   return(res_annual)
 }
 
@@ -526,11 +611,18 @@ build_imputation_branch_inputs <- function(
 
   branch_from_column <- function(column_name, branch_name) {
     count_value <- suppressWarnings(as.numeric(d_annual[[column_name]]))
+    se_val <- if ("Log_Nester_SE" %in% names(d_annual)) {
+      suppressWarnings(as.numeric(d_annual$Log_Nester_SE))
+    } else {
+      rep(0, nrow(d_annual))
+    }
+    se_val[!is.finite(se_val)] <- 0
     data.frame(
       Year = as.integer(d_annual$Year),
       Site = as.character(d_annual$Site),
       Count = count_value,
       Annual_Nesters = count_value / clutch_frequency,
+      Annual_Nesters_SE = se_val,
       Imputation_Branch = branch_name,
       stringsAsFactors = FALSE
     )
@@ -622,8 +714,17 @@ summarise_trend_result <- function(res, remigration_interval) {
   u_draws <- as.numeric(res$fit$sims.list$U)
   q_draws <- as.numeric(res$fit$sims.list$Q)
   r_draws <- res$fit$sims.list$R
-  r_mean <- if (is.matrix(r_draws)) rowMeans(r_draws) else as.numeric(r_draws)
-
+  
+  # Ensure r_mean always yields exactly length(u_draws) (500 rows)
+  r_mean <- if (is.null(r_draws)) {
+    rep(0, length(u_draws))
+  } else if (is.matrix(r_draws) && ncol(r_draws) > 1) {
+    rowMeans(r_draws)
+  } else {
+    as.numeric(r_draws)
+  }
+  if (length(r_mean) == 0) r_mean <- rep(0, length(u_draws))
+  
   list(
     X_total = x_total,
     years = years,
@@ -731,32 +832,20 @@ build_siders_projection_posterior <- function(
     drop = FALSE
   ]
   
+  # Safely extract single-column vectors from regional_nesters
+  n0_vec <- as.numeric(regional_nesters[, final_index])
+  n1_vec <- as.numeric(regional_nesters[, final_index - 1L])
+  n2_vec <- as.numeric(regional_nesters[, final_index - 2L])
+  n3_vec <- as.numeric(regional_nesters[, final_index - 3L])
+  
   posterior <- data.frame(
     Posterior_Row = seq_len(n_joint),
-    
-    U = u_draws[seq_len(n_joint)],
-    Q = q_draws[seq_len(n_joint)],
-    
-    N_fym0 = regional_nesters[
-      ,
-      final_index
-    ],
-    
-    N_fym1 = regional_nesters[
-      ,
-      final_index - 1L
-    ],
-    
-    N_fym2 = regional_nesters[
-      ,
-      final_index - 2L
-    ],
-    
-    N_fym3 = regional_nesters[
-      ,
-      final_index - 3L
-    ],
-    
+    U = as.numeric(u_draws[seq_len(n_joint)]),
+    Q = as.numeric(q_draws[seq_len(n_joint)]),
+    N_fym0 = n0_vec[seq_len(n_joint)],
+    N_fym1 = n1_vec[seq_len(n_joint)],
+    N_fym2 = n2_vec[seq_len(n_joint)],
+    N_fym3 = n3_vec[seq_len(n_joint)],
     stringsAsFactors = FALSE
   )
   
@@ -765,7 +854,7 @@ build_siders_projection_posterior <- function(
       posterior$N_fym1 +
       posterior$N_fym2 +
       posterior$N_fym3
-  ) * remigration_interval / 4
+  ) * (remigration_interval / 4)
   
   valid <- complete.cases(posterior) &
     is.finite(posterior$N_fym0) &
@@ -1059,28 +1148,32 @@ resolve_reference_site <- function(df, reference_site = NULL) {
 }
 
 # =====================================================================
-# EXACT STATE-SPACE TREND ENGINE
+# STATE-SPACE TREND ENGINE (STAN CMDSTANR IMPLEMENTATION)
 # =====================================================================
-# Methods 2.3, Eqs. 4-6: shared latent trend, reference-site offset A[1]=0.
-# Q and R are variances (precisions are their reciprocals); CF is applied
-# upstream once to convert annual nests into annual nesters.
 run_jags_aligned <- function(
     df, iter = 50000, burnin = 10000, thin = 10,
     n_chains = 3, parallel = FALSE,
-    reference_site = NULL) {
+    reference_site = NULL,
+    trend_prior_mode = 0L,
+    propagate_imputation_se = TRUE) {
+  
   validate_log_count_input(
     count = df$Annual_Nesters,
     label = "annual-nester"
   )
-
+  
   reference <- resolve_reference_site(df, reference_site)
   all_years <- min(df$Year, na.rm = TRUE):max(df$Year, na.rm = TRUE)
   sites <- reference$sites
-  n.yrs <- length(all_years); n.timeseries <- length(sites)
+  n_yrs <- length(all_years)
+  n_timeseries <- length(sites)
   
   prep_df <- df %>%
     group_by(Year, Site) %>%
-    summarise(Annual_Nesters = if(all(is.na(Annual_Nesters))) NA_real_ else sum(Annual_Nesters, na.rm = TRUE), .groups = "drop") %>%
+    summarise(
+      Annual_Nesters = if (all(is.na(Annual_Nesters))) NA_real_ else sum(Annual_Nesters, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
     complete(Year = all_years, Site = sites) %>%
     arrange(Year) %>%
     pivot_wider(names_from = Site, values_from = Annual_Nesters) %>%
@@ -1089,108 +1182,117 @@ run_jags_aligned <- function(
   mat_data <- as.matrix(prep_df)
   mat_data[is.nan(mat_data) | is.infinite(mat_data)] <- NA
   if (any(mat_data <= 0, na.rm = TRUE)) {
-    stop(
-      "Internal validation failure: non-positive annual-nester values reached ",
-      "the Gaussian log-count trend model."
-    )
+    stop("Internal validation failure: non-positive annual-nester values reached the Gaussian log-count trend model.")
   }
   Y_matrix <- t(log(mat_data))
+  Y_matrix[is.na(Y_matrix)] <- -999.0
   
-  jags_data <- list(
-    n.yrs = n.yrs, n.timeseries = n.timeseries, a_mean = 0, a_sd = 4,
-    u_mean = 0, u_sd = 0.5, q_alpha = 0.01, q_beta = 0.01, r_alpha = 0.01, r_beta = 0.01,
-    # Martin singleUQ: center X[1] on the first observation of the
-    # deliberately selected first/reference time series.
-    x0_mean = reference$x0_mean, x0_sd = 10
-  )
-  
-  if (n.timeseries == 1) {
-    jags_data$Y <- as.vector(Y_matrix)
-    jags_data$n.timeseries <- NULL
-    jags_data$a_mean <- NULL
-    jags_data$a_sd <- NULL
-    model_string <- "
-    model {
-      U ~ dnorm(u_mean, 1/(u_sd^2))
-      tauQ ~ dgamma(q_alpha, q_beta)
-      Q <- 1/tauQ
-      
-      X0 ~ dnorm(x0_mean, 1/(x0_sd^2))
-      predX[1] <- X0 + U
-      X[1] <- predX[1]
-      
-      for(t in 2:n.yrs) {
-        predX[t] <- X[t-1] + U
-        X[t] ~ dnorm(predX[t], tauQ)
-      }
-      tauR ~ dgamma(r_alpha, r_beta)
-      R <- 1/tauR
-      for(t in 1:n.yrs) { Y[t] ~ dnorm(X[t], tauR) }
-    }"
-    params <- c("U", "Q", "R", "X0", "X")
+  # Imputation SE passed in quadrature (Deliberate Extension #5)
+  if (isTRUE(propagate_imputation_se) && "Annual_Nesters_SE" %in% names(df)) {
+    prep_se <- df %>%
+      group_by(Year, Site) %>%
+      summarise(
+        Annual_Nesters_SE = if (all(is.na(Annual_Nesters_SE))) 0 else mean(Annual_Nesters_SE, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      complete(Year = all_years, Site = sites, fill = list(Annual_Nesters_SE = 0)) %>%
+      arrange(Year) %>%
+      pivot_wider(names_from = Site, values_from = Annual_Nesters_SE) %>%
+      select(all_of(sites))
+    Y_se_matrix <- t(as.matrix(prep_se))
+    Y_se_matrix[is.na(Y_se_matrix) | !is.finite(Y_se_matrix)] <- 0.0
   } else {
-    jags_data$Y <- Y_matrix
-    jags_data$Z <- matrix(rep(1, n.timeseries), ncol=1)
-    model_string <- "
-    model {
-      A[1] <- 0
-      for(j in 2:n.timeseries) { A[j] ~ dnorm(a_mean, 1/(a_sd^2)) }
-      U ~ dnorm(u_mean, 1/(u_sd^2))
-      tauQ ~ dgamma(q_alpha, q_beta)
-      Q <- 1/tauQ
-      X0 ~ dnorm(x0_mean, 1/(x0_sd^2))
-      predX[1] <- X0 + U
-      X[1] <- predX[1]
-      for(t in 2:n.yrs) {
-        predX[t] <- X[t-1] + U
-        X[t] ~ dnorm(predX[t], tauQ)
-      }
-      for(j in 1:n.timeseries) {
-        tauR[j] ~ dgamma(r_alpha, r_beta)
-        R[j] <- 1/tauR[j]
-        for(t in 1:n.yrs) {
-          predY[j,t] <- Z[j,1] * X[t] + A[j]
-          Y[j,t] ~ dnorm(predY[j,t], tauR[j])
-        }
-      }
-    }"
-    params <- c("U", "Q", "R", "X0", "X", "A")
+    Y_se_matrix <- matrix(0.0, nrow = n_timeseries, ncol = n_yrs)
   }
   
-  # Parallel JAGS workers cannot safely receive a textConnection.
-  # Write the trend model to a temporary file accessible to every worker.
-  
-  trend_model_file <- tempfile(
-    pattern = "trend_model_",
-    fileext = ".bug"
+  stan_data <- list(
+    n_years = n_yrs,
+    n_timeseries = n_timeseries,
+    Y = Y_matrix,
+    Y_se = Y_se_matrix,
+    N0_mean = reference$x0_mean,
+    trend_prior_mode = as.integer(trend_prior_mode),
+    sigma_proc_scale = 0.25,
+    sigma_obs_scale = 0.5,
+    sigma_proc_upper = if (as.integer(trend_prior_mode) == 0L) 1.0 else 2.0,
+    sigma_obs_upper  = if (as.integer(trend_prior_mode) == 0L) 2.0 else 2.0
   )
   
-  writeLines(
-    model_string,
-    con = trend_model_file
+  # Check execution setting: exploration vs publication
+  is_fast <- iter <= 15000 && !isTRUE(parallel)
+  chains_run <- if (is_fast) 2L else max(3L, as.integer(n_chains))
+  iter_warmup <- if (is_fast) 250L else 1000L
+  iter_sampling <- if (is_fast) 250L else 1000L
+  
+  mod_trend <- get_trend_model()
+  fit_trend <- mod_trend$sample(
+    data = stan_data,
+    chains = chains_run,
+    parallel_chains = chains_run,
+    iter_warmup = iter_warmup,
+    iter_sampling = iter_sampling,
+    thin = 1,
+    adapt_delta = 0.995,
+    max_treedepth = 14,
+    refresh = 0,
+    show_messages = FALSE
   )
   
-  on.exit(
-    unlink(trend_model_file),
-    add = TRUE
+  r_draws <- as.numeric(posterior::as_draws_matrix(fit_trend$draws("r")))
+  sigma_proc_draws <- as.numeric(posterior::as_draws_matrix(fit_trend$draws("sigma_proc")))
+  sigma_obs_mat <- as.matrix(posterior::as_draws_matrix(fit_trend$draws("sigma_obs")))
+  ntrue_mat <- as.matrix(posterior::as_draws_matrix(fit_trend$draws("N_true")))
+  a_mat <- as.matrix(posterior::as_draws_matrix(fit_trend$draws("A")))
+  
+  colnames(ntrue_mat) <- sprintf("X[%d]", seq_len(n_yrs))
+  colnames(a_mat) <- sprintf("A[%d]", seq_len(n_timeseries))
+  
+  # Ensure R is always shaped as a matrix with n_timeseries columns
+  r_mat <- matrix(as.numeric(sigma_obs_mat^2), nrow = length(r_draws), ncol = n_timeseries)
+  
+  sims_list <- list(
+    U = r_draws,
+    Q = sigma_proc_draws^2,  # Process variance Q = sigma_proc^2
+    R = r_mat,               # Guaranteed non-empty matrix
+    X0 = as.numeric(posterior::as_draws_matrix(fit_trend$draws("N0"))),
+    X = ntrue_mat,           # Latent log abundance states
+    A = if (n_timeseries > 1) a_mat else NULL  # NULL for single-site maintains downstream contracts
   )
   
-  fit <- jagsUI::jags(
-    data = jags_data,
-    parameters.to.save = params,
-    model.file = trend_model_file,
-    n.chains = n_chains,
-    n.iter = iter,
-    n.burnin = burnin,
-    n.thin = thin,
-    parallel = parallel,
-    verbose = FALSE
+  # Convert CmdStan draws into genuine coda MCMC chains including latent states (N_true)
+  var_names <- c("r", "sigma_proc", "N0", "N_true")
+  if (n_timeseries > 1) var_names <- c(var_names, "A")
+  samples_mcmc <- stan_draws_to_mcmc_list(fit_trend$draws(var_names))
+  
+  # Map variable names (r -> U, sigma_proc^2 -> Q, N_true -> X) so developer diagnostics work cleanly
+  for (i in seq_along(samples_mcmc)) {
+    mat_ch <- as.matrix(samples_mcmc[[i]])
+    colnames(mat_ch)[colnames(mat_ch) == "r"] <- "U"
+    if ("sigma_proc" %in% colnames(mat_ch)) {
+      mat_ch <- cbind(mat_ch, Q = mat_ch[, "sigma_proc"]^2)
+    }
+    colnames(mat_ch) <- gsub("^N_true\\[", "X[", colnames(mat_ch))
+    samples_mcmc[[i]] <- coda::mcmc(mat_ch, start = 1, thin = 1)
+  }
+  
+  summary_df <- as.data.frame(fit_trend$summary())
+  rownames(summary_df) <- summary_df$variable
+  
+  fit <- list(
+    sims.list = sims_list,
+    samples = samples_mcmc,
+    summary = summary_df,
+    cmdstan_fit = fit_trend,
+    dev_record = list(
+      model = TREND_STAN_SRC,
+      data = stan_data,
+      parameters = c("r", "sigma_proc", "sigma_obs", "N0", "A", "N_true"),
+      sampling = list(chains = chains_run, warmup = iter_warmup, sampling = iter_sampling),
+      sampler_diagnostics = fit_trend$sampler_diagnostics(),
+      app_version = "guided-stan-2026"
+    )
   )
   
-  fit$dev_record <- list(model=model_string, data=jags_data, parameters=params,
-    sampling=list(chains=n_chains, iterations=iter, burnin=burnin, thin=thin, parallel=parallel),
-    seed_note="Automatic initialization; no exact replay seed retained.",
-    app_version="guided-developer-2026-09-02")
   return(list(
     fit = fit,
     years = all_years,
@@ -1489,133 +1591,61 @@ siders_age_from_length <- function(length_cm, params) {
   age
 }
 
-siders_demographic_path <- function(length_cm, params, horizon, start_age = NULL) {
-
-  if (length(horizon) != 1L || !is.finite(horizon) || horizon < 1) {
-    stop("horizon must be a positive integer.")
-  }
-  horizon <- as.integer(horizon)
-
-  age0 <- if (is.null(start_age)) siders_age_from_length(length_cm, params) else start_age
-  if (length(age0) != 1L || !is.finite(age0)) {
-    stop("This manuscript helper expects one starting length.")
-  }
-
-  max_age_99 <- siders_forced_first_nesting_age(
-    params$linf,
-    params$k,
-    params$t0,
-    threshold = 0.99
-  )
-
-  at_or_beyond_max <- (
-    age0 >= max_age_99 ||
-      isTRUE(all.equal(age0, max_age_99, tolerance = 1e-12))
-  )
-
-  if (at_or_beyond_max) {
-
-    lengths <- rep(
-      params$linf * params$mat_p,
-      horizon
-    )
-
-  } else {
-
-    growth_ages_to_max <- seq(
-      age0,
-      max_age_99,
-      by = 1
-    )
-
-    year_reaching_max <- length(growth_ages_to_max)
-
-    if (year_reaching_max < horizon) {
-
-      lengths <- c(
-        params$linf * (
-          1 -
-            exp(
-              -params$k *
-                (growth_ages_to_max - params$t0)
-            )
-        ),
-        rep(
-          params$linf * params$mat_p,
-          horizon - year_reaching_max
-        )
-      )
-
-    } else {
-
-      growth_ages <- seq(
-        age0,
-        length.out = horizon,
-        by = 1
-      )
-
-      lengths <- params$linf * (
-        1 -
-          exp(
-            -params$k *
-              (growth_ages - params$t0)
-          )
-      )
-    }
-  }
-
-  lengths <- lengths[seq_len(horizon)]
-
-  p_maturity <- maturity_probability(
-    lengths,
-    params$lmat,
-    params$sig_mat,
-    params$linf,
-    params$mat_p
-  )
-
-  # Exact ordering in prop_ane(): the continuous p(M) values are first used to
-  # construct the juvenile/adult survival mixture. The Bernoulli first-nesting
-  # history is generated only afterward.
-  # Methods Eqs. 10-11: probability-weighted survival before allocation.
-  annual_survival <- (
-    (1 - p_maturity) * params$pj +
-      p_maturity * params$pa
-  )
-  survival_to_year <- cumprod(annual_survival)
-
+# Demographic pathway with analytical marginalization
+calculate_demographic_pathway <- function(start_length_cm, params, horizon = 35L) {
+  mat_p <- if (is.null(params$mat_p)) 0.99 else params$mat_p
+  safe_len <- pmin(start_length_cm, mat_p * params$linf - 1e-5)
+  age0 <- params$t0 - log1p(-safe_len / params$linf) / params$k
+  ages <- age0 + (0:(horizon - 1L))
+  
+  lengths <- params$linf * (1 - exp(-params$k * (ages - params$t0)))
+  lengths[lengths >= mat_p * params$linf] <- mat_p * params$linf
+  
+  # Analytical sequential first-success calculation (Deliberate Extension #3)
+  z <- (lengths - params$lmat) / params$sig_mat
+  p_trans <- ifelse(lengths >= mat_p * params$linf, 1, plogis(z))
+  p_first <- p_trans * cumprod(c(1, 1 - head(p_trans, -1L)))
+  p_first[!is.finite(p_first)] <- 0
+  
+  annual_phi <- (1 - p_trans) * params$pj + p_trans * params$pa
+  cum_survival <- cumprod(annual_phi)
+  annual_ane <- cum_survival * p_first * params$pf / params$ri
+  
   list(
-    age = age0 + seq.int(0, horizon - 1L),
-    length = lengths,
-    maturity_probability = p_maturity,
-    annual_survival = annual_survival,
-    survival_to_year = survival_to_year
+    ages = ages,
+    lengths = lengths,
+    p_transition = p_trans,
+    p_first_nesting = p_first,
+    annual_survival = annual_phi,
+    cumulative_survival = cum_survival,
+    annual_ane = annual_ane,
+    total_ane = sum(annual_ane)
+  )
+}
+
+
+siders_demographic_path <- function(length_cm, params, horizon, start_age = NULL) {
+  horizon <- as.integer(horizon)
+  len_in <- if (is.null(start_age)) length_cm else params$linf * (1 - exp(-params$k * (start_age - params$t0)))
+  path <- calculate_demographic_pathway(len_in, params, horizon = horizon)
+  list(
+    age = path$ages,
+    length = path$lengths,
+    maturity_probability = path$p_transition,
+    annual_survival = path$annual_survival,
+    survival_to_year = path$cumulative_survival
   )
 }
 
 first_nesting_path <- function(length_cm, params, horizon) {
-
-  path <- siders_demographic_path(
-    length_cm = length_cm,
-    params = params,
-    horizon = horizon
-  )
-
-  # p = annual probability governing first nesting (Siders p(M))
-  p <- path$maturity_probability
-
-  # Methods paper expected first-event probability.
-  p.FN <- p * cumprod(c(1, head(1 - p, -1)))
-
-  # Eq. 9: sum(p.FN) <= 1; no repeat allocation after first nesting.
-  first_nesting_probability <- p.FN
-
-  c(
-    path,
-    list(
-      first_nesting_probability =
-        first_nesting_probability
-    )
+  path <- calculate_demographic_pathway(length_cm, params, horizon = horizon)
+  list(
+    age = path$ages,
+    length = path$lengths,
+    maturity_probability = path$p_transition,
+    annual_survival = path$annual_survival,
+    survival_to_year = path$cumulative_survival,
+    first_nesting_probability = path$p_first_nesting
   )
 }
 
@@ -4355,6 +4385,21 @@ run_mathematical_self_checks <- function(
     )
   )
   
+  # Whole-unit quota rounding tie check
+  rounded_test <- round_up_quota(c(20, 20 + 64 * .Machine$double.eps, 20.000001))
+  add_check("Whole-unit quota rounding handles floating-point ties",
+            identical(as.numeric(rounded_test), c(20, 20, 21)),
+            0, "Floating-point noise around exact integers does not increment ceiling.",
+            paste("Observed:", paste(rounded_test, collapse = ", ")))
+  
+  # Adult ANE analytical identity check
+  adult_path_check <- calculate_demographic_pathway(0.99 * test_params$linf, test_params, horizon = 35L)
+  expected_adult_id <- test_params$pa * test_params$pf / test_params$ri
+  diff_adult_id <- abs(adult_path_check$total_ane - expected_adult_id)
+  add_check("Adult ANE analytic identity", diff_adult_id <= tolerance, diff_adult_id,
+            "With forced first-nesting probability 1, adult ANE equals phi_adult * pf / RI.",
+            sprintf("Observed: %.8f, Expected: %.8f", adult_path_check$total_ane, expected_adult_id))
+  
   # Methods-specific checks: exercise the public kernels and CSV contract.
   terminal <- c(rep(0, test_horizon - 1L), 2.5)
   terminal_loss <- siders_fishery_ane_one_sim(
@@ -6261,8 +6306,38 @@ ui <- page_fluid(
         ),ux_back_next("back_step3","← Your turtles","go_step5","Continue: threats & actions →")
       )),
       nav_panel("Threats & actions",value="step5",ux_section("What might change?","Describe a threat or an action. Save each option to compare it later.",
-        tags$details(tags$summary("Forecast years & population"),fluidRow(column(6,selectInput("pva_site_filter","Population",c("All Beaches (Regional Total)"))),column(6,sliderInput("pva_years","Years into the future",10,100,50,step=10))),uiOutput("ux_forecast_range")),
-        dev_only(numericInput("pva_sims","Projection simulations",500,min=100,max=100000,step=100),ux_methods_ui()),
+      tags$details(tags$summary("Forecast years & population"),fluidRow(column(6,selectInput("pva_site_filter","Population",c("All Beaches (Regional Total)"))),column(6,sliderInput("pva_years","Years into the future",10,100,50,step=10))),uiOutput("ux_forecast_range")),
+        
+        # --- TOP-LEVEL SIMULATION SELECTION: DEMO (100) VS. MANAGER (1,000) ---
+        div(
+          class = "ux-panel",
+          style = "padding: 12px 18px; margin-bottom: 16px; background: #ffffff; border: 1px solid #d9dfd8; border-radius: 8px;",
+          fluidRow(
+            column(8,
+              radioButtons(
+                "sim_run_preset",
+                label = tags$span(
+                  tags$b("Simulation Runs (PVA Engine):"),
+                  ux_info("Simulation Count", "100 runs provides sub-second feedback for live demonstrations. 1,000 runs provides stable posterior distributions suitable for formal management decisions.")
+                ),
+                choices = c(
+                  "⚡ Quick Demo (100 runs)" = "100",
+                  "📋 Manager / Assessment (1,000 runs)" = "1000",
+                  "⚙️ Custom" = "custom"
+                ),
+                selected = "100",
+                inline = TRUE
+              )
+            ),
+            column(4,
+              conditionalPanel(
+                condition = "input.sim_run_preset == 'custom' || input.developer_view === true",
+                numericInput("pva_sims", "Custom Simulation Count:", value = 100, min = 50, max = 100000, step = 100)
+              )
+            )
+          )
+        ),
+        dev_only(ux_methods_ui()),
         fluidRow(column(7,div(class="ux-panel",
           textInput("ux_scenario_name","Scenario name",placeholder="e.g. Additional bycatch"),
           radioButtons("pva_mode","Add an option",c("Threat"="mode_threat","Conservation action"="mode_action","Combination"="mode_portfolio"),selected="mode_threat",inline=TRUE),
@@ -6316,10 +6391,6 @@ server <- function(input, output, session) {
     }
     if(!is.null(vault$dev_imputation)) choices$imputation <- list(fit=vault$dev_imputation,kind="imputation")
     choices
-  })
-  output$dev_fit_selector <- renderUI({
-    choices <- names(dev_fit_choices());req(length(choices))
-    selectInput("dev_fit_choice","Fit to inspect",setNames(choices,sub("^regional$","Active regional trend",choices)),selected=isolate(input$dev_fit_choice) %||% "regional",width="100%")
   })
   dev_selected_fit <- reactive({
     choices <- dev_fit_choices();req(length(choices))
@@ -6921,7 +6992,9 @@ server <- function(input, output, session) {
     if (!ux_fit_current()) return("Estimate the population with the current inputs in step 3 first.")
     if (!is.null(ux_biology_problem())) return(ux_biology_problem())
     sims <- input$pva_sims
-    if (length(sims)!=1 || !is.finite(sims) || sims<100 || sims!=floor(sims)) return("Use a whole number of at least 100 projection simulations.")
+    if (length(sims) != 1 || !is.finite(sims) || sims < 50 || sims != floor(sims)) {
+      return("Use a whole number of at least 50 projection simulations.")
+    }
     selected <- input$ux_compare_ids %||% character(0)
     if (!is.null(ux$editing_id) && ux$editing_id %in% selected && ux_editor_dirty()) return("The selected scenario has unsaved editor changes. Save it in step 4, or load its saved version before comparing.")
     for (id in selected) {
@@ -7344,6 +7417,13 @@ server <- function(input, output, session) {
     showNotification(sprintf("Generated & queued %d sensitivity scenarios!", length(sweep_vals)), type = "message", duration = 6)
   })
   
+  # Synchronize Quick Demo vs. Manager radio buttons with pva_sims
+  observeEvent(input$sim_run_preset, {
+    if (input$sim_run_preset != "custom") {
+      updateNumericInput(session, "pva_sims", value = as.integer(input$sim_run_preset))
+    }
+  })
+  
   # --- SPECIES PRESET UPDATER ---
   
   observeEvent(input$parameter_preset, {
@@ -7356,77 +7436,27 @@ server <- function(input, output, session) {
     # ---------------------------------------------------------------
     if (identical(preset, "wp_leatherback")) {
       
-      updateNumericInput(
-        session,
-        "clutch_freq",
-        value = 5.5
-      )
+      updateNumericInput(session, "clutch_freq", value = 5.5)
+      updateNumericInput(session, "remig_int", value = 3.06)
+      updateNumericInput(session, "linf", value = 142.7)
+      updateNumericInput(session, "k", value = 0.2262)
+      updateNumericInput(session, "tknot", value = -0.17)
+      updateNumericInput(session, "max_age", value = 20.19)
+      updateNumericInput(session, "lmat", value = 139.1325)
+      updateNumericInput(session, "sig_mat", value = 6.3399)
+      updateNumericInput(session, "pf", value = 0.73)
+      updateNumericInput(session, "ane_pj", value = 0.81)
+      updateNumericInput(session, "ane_pa", value = 0.893)
       
-      updateNumericInput(
-        session,
-        "remig_int",
-        value = 3.06
-      )
-      
-      updateNumericInput(
-        session,
-        "linf",
-        value = 142.7
-      )
-      
-      updateNumericInput(
-        session,
-        "k",
-        value = 0.2262
-      )
-      
-      updateNumericInput(
-        session,
-        "tknot",
-        value = -0.17
-      )
-      
-      # Siders forced-maturity age:
-      # age at 99% of Linf under the supplied VBGF
-      updateNumericInput(
-        session,
-        "max_age",
-        value = 20.19
-      )
-      
-      # 97.5% of Linf; center of the Siders maturity ogive
-      updateNumericInput(
-        session,
-        "lmat",
-        value = 139.1325
-      )
-      
-      updateNumericInput(
-        session,
-        "sig_mat",
-        value = 6.3399
-      )
-      
-      updateNumericInput(
-        session,
-        "pf",
-        value = 0.73
-      )
-      
-      updateNumericInput(
-        session,
-        "ane_pj",
-        value = 0.81
-      )
-      
-      updateNumericInput(
-        session,
-        "ane_pa",
-        value = 0.893
-      )
+      # Explicit counterfactual nest defaults
+      updateNumericInput(session, "override_eggs", value = 77.9)
+      updateNumericInput(session, "override_syr1", value = 0.0625)
+      updateNumericInput(session, "action_counterfactual_emergence", value = 0.60)
+      updateNumericInput(session, "action_protected_emergence", value = 0.70)
+      updateSelectInput(session, "action_emergence_basis", selected = "per_egg")
       
       showNotification(
-        "Western Pacific leatherback reference parameters loaded.",
+        "Western Pacific leatherback reference profile loaded.",
         type = "message",
         duration = 4
       )
@@ -7918,7 +7948,7 @@ server <- function(input, output, session) {
         sprintf(
           paste0(
             "QA/QC Alert: Found %d observed zero count(s). The inherited ",
-            "Martin/Siders Gaussian log-count model cannot represent a true ",
+            "Martin/Eguchi/Siders Gaussian log-count model cannot represent a true ",
             "zero. If these rows mean no monitoring, leave Count blank and set ",
             "Monitored to FALSE. Genuine zeros require a count-data observation ",
             "model and this run will be blocked."
@@ -8558,14 +8588,12 @@ server <- function(input, output, session) {
 
         d_annual <- run_fourier_imputation(
           d_mapped,
-          iter = if (isTRUE(input$legacy_fourier_mcmc)) {
-            100000
-          } else {
-            max(2000, floor(input$iterations / 5))
-          },
+          iter = if (isTRUE(input$legacy_fourier_mcmc)) 100000 else 2000,
           six_month_sites = input$six_month_sites,
           legacy_mcmc = isTRUE(input$legacy_fourier_mcmc),
-          season_start_month = season_start_month
+          season_start_month = season_start_month,
+          clutch_frequency = input$clutch_freq,
+          clutch_frequency_sd = 1.6
         )
       } else {
         d_annual <- d_mapped %>%
