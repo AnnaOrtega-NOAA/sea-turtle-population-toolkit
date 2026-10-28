@@ -1,580 +1,199 @@
-# Sea Turtle Population Toolkit
+# 🐢 Sea Turtle Population Toolkit
 
-A Shiny decision-support toolkit for turning sea turtle nesting records into population trends and scenario comparisons for threats and conservation actions.
+<p align="left">
+  <img src="https://img.shields.io/badge/R-%3E%3D4.0-276DC3.svg?logo=r" alt="R version" />
+  <img src="https://img.shields.io/badge/Shiny-Interactive%20App-0072B2.svg?logo=rstudio" alt="Shiny" />
+  <img src="https://img.shields.io/badge/Backend-CmdStanR-CC0000.svg" alt="CmdStanR" />
+  <img src="https://img.shields.io/badge/Status-Early%20Public%20Release-2E7D32.svg" alt="Status" />
+</p>
 
-The toolkit is designed for conservation practitioners who need a transparent path from monitoring data to population-level inference without requiring advanced modeling expertise.
+> **A decision-support application for translating nesting-beach monitoring records into unified population trajectories and evaluating management scenarios for threats and conservation actions.**
 
----
-
-## Overview
-
-Sea turtle monitoring programs often collect nesting data over many years, but those records can contain missing months, multiple beaches, changing survey effort, and substantial uncertainty.
-
-At the same time, management questions are rarely limited to whether a population is increasing or decreasing. Practitioners may also need to ask:
-
-- What could happen if a threat continues?
-- How much difference could reducing mortality make?
-- When would benefits from nest protection or headstarting become visible?
-- How do several management scenarios compare?
-- How much uncertainty comes from the monitoring data or demographic assumptions?
-
-The Sea Turtle Population Toolkit brings these steps into one workflow.
-
-Users can move from nesting records to population estimation, construct threat or conservation scenarios, and compare projected outcomes using a shared demographic currency.
+Designed for conservation practitioners, managers, and researchers who need an evidence-based path from incomplete field monitoring data to population-level viability without requiring custom Bayesian MCMC coding.
 
 ---
 
-## What the toolkit does
+## 🧭 The 5-Stage Workflow
 
-The application guides users through five main stages.
+1. **Add Nesting Data**  
+   Upload annual or monthly nesting records across single or multiple index beaches. The built-in Bayesian Fourier model reconstructs unmonitored seasonal gaps while preserving observed counts.
 
-### 1. Add nesting data
+2. **Describe Population Biology**  
+   Specify population-specific demographic parameters (clutch frequency, remigration interval, somatic growth, and stage survival) rather than defaulting to generic global averages.
 
-Upload annual or monthly nesting records.
+3. **Estimate Status & Trend**  
+   Fit a unified Bayesian state-space model via **CmdStanR** to estimate long-term exponential growth rate (*r*), annual process error (*σ*<sub>proc</sub>), and site-specific scaling factors.
 
-The toolkit can:
+4. **Build Scenarios (Take & Give)**  
+   Define threat schedules (mortality across size classes) and conservation actions (nest protection, headstarting, adult mortality prevention) standardized into a shared metric: **Annual Nester Equivalents (ANE)**.
 
-- use annual nest counts directly;
-- accommodate multiple nesting sites;
-- identify periods without monitoring;
-- reconstruct missing monthly observations using seasonal Fourier imputation;
-- distinguish missing monitoring from genuine observed counts.
-
-### 2. Describe the population
-
-Enter population-specific biological parameters such as:
-
-- clutch frequency;
-- remigration interval;
-- proportion female;
-- von Bertalanffy growth parameters;
-- size at maturity;
-- maturity-ogive width;
-- juvenile survival;
-- adult survival.
-
-The application does not automatically substitute global species averages for population-specific parameters.
-
-### 3. Estimate population status
-
-The toolkit converts nests to annual nesting females and estimates:
-
-- historical annual-nester abundance;
-- long-term instantaneous population trend;
-- process variance;
-- observation variance;
-- regional population trajectories;
-- current reproductive-female abundance summaries.
-
-An optional developer view exposes additional diagnostics and posterior outputs.
-
-### 4. Build scenarios
-
-Users can save multiple named scenarios representing:
-
-- threats;
-- conservation actions;
-- combined portfolios.
-
-Threat examples include fisheries interactions or other sources of mortality.
-
-Conservation examples can include:
-
-- nest protection;
-- headstarting;
-- prevention of adult mortality.
-
-Scenarios are retained independently so alternative assumptions can be saved and compared.
-
-### 5. Compare projected outcomes
-
-Saved scenarios are projected against the same underlying population state.
-
-Scenario comparisons share:
-
-- initial posterior draws;
-- annual trend and process-variance draws;
-- environmental stochasticity.
-
-This matched design reduces Monte Carlo noise when comparing management alternatives.
-
-Outputs include:
-
-- projected annual nesting-female abundance;
-- uncertainty intervals;
-- scenario summaries;
-- downloadable simulation draws;
-- run settings;
-- mathematical diagnostics.
+5. **Project & Compare Outcomes**  
+   Run paired stochastic 30-year projections. Alternative management actions are evaluated against the same environmental noise and posterior draws to isolate real policy differences from simulation noise.
 
 ---
 
-## Scientific framework
+## ⚖️ Demographic Standardization: Annual Nester Equivalents (ANE)
 
-The toolkit retains the mathematical lineage of population assessments developed by Martin and subsequently extended by Siders for sea turtle population-impact analyses.
+Monitoring counts breeding females, but threats and conservation actions often impact juveniles, subadults, or eggs. Directly comparing raw counts across life stages obscures survival to maturity, somatic growth delays, and remigration intervals. The toolkit standardizes all impacts into **Annual Nester Equivalents (ANE)**:
 
-The retained components include:
+* **Threats (Take):** An interaction at length *L* is projected through somatic growth to determine the timing and probability of first nesting, discounted by cumulative survival, sex ratio, remigration interval, and interaction mortality.
+* **Conservation (Give):** Credited strictly as the *incremental benefit* relative to a no-intervention counterfactual. Additional hatchlings, headstarted yearlings, or saved adults follow the same demographic engine before contributing to future nesting abundance.
 
-- conversion of nesting records to annual nesting females;
-- Bayesian state-space estimation of population trend;
-- process and observation variance;
-- annual-nester population projections;
-- remigration-interval abundance summaries;
-- translation of affected turtles into annual nester equivalents;
-- first-nesting-only demographic accounting;
-- fishery Take applied before population growth;
-- paired dynamic posterior draws of population trend and process variance.
+<details>
+<summary><b>🔬 View Mathematical Formulations & Projection Equations</b> (Click to expand)</summary>
 
-The application also introduces explicitly labeled extensions for conservation actions, scenario comparison, input uncertainty, and decision-support presentation.
+<br>
 
----
+### 1. Somatic Growth (von Bertalanffy)
+$$L(A) = L_\infty \left[ 1 - \exp\{-k(A - t_0)\} \right]$$
 
-## Annual nester equivalents
+### 2. Transition Toward First Nesting
+$$p(T_{i,t}) = \begin{cases} 1, & L_{i,t} \ge 0.99 L_\infty \\ \left[ 1 + \exp\left( -\frac{L_{i,t} - L_{\text{mat}}}{\sigma_{\text{mat}}} \right) \right]^{-1}, & L_{i,t} < 0.99 L_\infty \end{cases}$$
 
-Threats affect turtles at different ages and sizes, while the monitored population is usually expressed in terms of nesting females.
+### 3. First-Nesting Distribution (Discrete Hazard)
+Calculates the marginal probability that first nesting occurs in year $t$ without Monte Carlo sampling error:
+$$p(FN_{i,t}) = p(T_{i,t}) \prod_{y=1}^{t-1} \left[ 1 - p(T_{i,y}) \right]$$
 
-The toolkit therefore translates affected turtles into **annual nester equivalents (ANE)**.
+### 4. Cumulative Survival
+$$\Phi_{i,t} = \left[ 1 - p(T_{i,t}) \right] \Phi_{\text{juv}} + p(T_{i,t}) \Phi_{\text{adult}}, \qquad S_{i,t} = \prod_{y=1}^t \Phi_{i,y}$$
 
-For a turtle entering the calculation at a given size, the expected contribution to future annual nesting abundance depends on:
+### 5. Annual Nester Equivalent (ANE) Standardization
+* **Threat (Take):**
+  $$ANE_{i,t}^T = S_{i,t} \cdot p(FN_{i,t}) \cdot p(F) \cdot \left(\frac{1}{RI}\right) \cdot D_i$$
+* **Conservation (Give):**
+  $$ANE_{a,t}^G = \Delta n_a \cdot S_{a,t} \cdot p(FN_{a,t}) \cdot p(F) \cdot \left(\frac{1}{RI}\right)$$
 
-- growth and age;
-- probability of maturity;
-- probability of first nesting;
-- survival;
-- probability of being female;
-- remigration interval;
-- mortality associated with the threat.
+### 6. Recursive Population Projection
+$$N_{t+1} = \max\left[0, \; \max\left(0, N_t - ANE_t^T\right) \exp\left(r + \sigma_{\text{proc}} z_t\right) + ANE_{t+1}^G\right]$$
 
-The probability of first nesting in year j is represented as:
+where $z_t \sim \text{Normal}(0, 1)$ represents annual environmental process variation. Take is deducted prior to annual growth, while matured Give is added after the transition.
 
-```math
-p(FN_j) = p(M_j)\prod_{h \lt j}\left[1-p(M_h)\right]
-```
-
-This assigns each turtle to its expected first nesting event only once.
-
-The resulting threat contribution is standardized to annual nesting females.
+</details>
 
 ---
 
-## Population projection
+## 📋 Data File Formats
 
-The retained Martin/Siders projection structure is:
+Upload data using clean CSV files formatted as follows:
 
-```math
-N_{t+1} = \max\left(0,\; \max(0,N_t-T_t)e^{U_t} + \sqrt{Q_t}z_t + G_t\right)
-```
-
-where:
-
-- `N_t` is annual nesting-female abundance;
-- `T_t` is threat-related ANE loss;
-- `U_t` is instantaneous population trend;
-- `Q_t` is process variance;
-- `z_t` is a standard-Normal process innovation;
-- `G_t` is conservation-related ANE gain.
-  
-where:
-
-- \(N_t\) is annual nesting-female abundance;
-- \(T_t\) is threat-related ANE loss;
-- \(U_t\) is instantaneous population trend;
-- \(Q_t\) is process variance;
-- \(z_t\) is a standard-Normal process innovation;
-- \(G_t\) is conservation-related ANE gain.
-
-Threat-related Take is removed **before population growth**.
-
-Conservation Give is an explicit extension and is added **after the retained Take-growth-process transition**.
-
-Negative projected abundance is bounded at zero as a numerical safeguard.
-
----
-
-## Conservation Give
-
-Positive conservation effects are represented as **counterfactual gains**.
-
-The toolkit does not automatically credit every turtle, egg, hatchling, or adult associated with a conservation program.
-
-Instead, the relevant quantity is the additional contribution attributable to the intervention relative to what would have happened without it.
-
-### Nest protection
-
-Benefit is based on the additional hatchlings produced relative to the unprotected counterfactual.
-
-### Headstarting
-
-Benefit is based on the **net additional turtles alive because of the intervention**, rather than simply the number released.
-
-### Adult protection
-
-Benefit is based on adult deaths prevented relative to the counterfactual.
-
-These additional cohorts are propagated forward through survival, maturation, first nesting, sex ratio, and remigration rather than receiving an immediate adult-equivalent credit.
-
----
-
-## Monitoring-data gaps
-
-Monthly nesting records can contain periods when surveys did not occur.
-
-The toolkit distinguishes:
-
-- a genuine observed count;
-- an observed zero;
-- a period with no monitoring.
-
-Missing monitoring can be reconstructed using the seasonal imputation model.
-
-A genuine observed zero is not silently treated as missing because the retained Gaussian log-count model cannot accommodate zero directly.
-
-Users should therefore preserve the distinction between:
-
-```text
-Count = blank, Monitored = FALSE
-```
-
-and:
-
-```text
-Count = 0, Monitored = TRUE
-```
-
-The latter requires a different observation-model formulation.
-
----
-
-## Expected input format
-
-### Nesting data
-
-CSV columns:
-
-```text
+### 1. Nesting Monitoring Data
+```csv
 Year,Month,Site,Count,Monitored
+2015,5,Beach_A,42,TRUE
+2015,6,Beach_A,,FALSE
+2015,7,Beach_A,0,TRUE
 ```
 
-For annual records, `Month` can be left blank.
+> [!NOTE]
+> Distinguish periods with no survey effort (`Count = blank, Monitored = FALSE`) from confirmed zero nesting (`Count = 0, Monitored = TRUE`).
 
-`Count` refers to nests, not turtles.
-
-### Threat schedules
-
-CSV columns:
-
-```text
+### 2. Threat Schedules (Take)
+```csv
 year,turtles,median_cm,mortality
+2028,25,85,0.35
+2029,15,142,1.00
 ```
 
-where:
-
-- `turtles` = number affected during that year;
-- `median_cm` = representative carapace length;
-- `mortality` = probability of death per affected turtle.
-
-For example:
-
-```text
-2030,25,85,0.35
-```
-
-means 25 turtles affected, with representative length 85 cm and mortality probability 0.35.
-
-Do not pre-multiply turtle numbers by mortality.
-
-### Conservation schedules
-
-Conservation uploads use:
-
-```text
+### 3. Conservation Schedules (Give)
+```csv
 Year,Amount
+2028,500
+2029,500
+```
+*(Where `Amount` represents clutches protected, yearlings released, or adult mortalities averted).*
+
+---
+
+## ⚙️ Installation & Requirements
+
+The toolkit runs in **R** ($\ge 4.0$) and uses **CmdStanR** for Bayesian model fitting.
+
+### 1. Install C++ Toolchain
+Stan compiles models to native C++. Ensure a C++ compiler is available:
+* **Windows:** Install [Rtools](https://cran.r-project.org/bin/windows/Rtools/) matching your R version.
+* **macOS:** Run `xcode-select --install` in the terminal.
+* **Linux:** Install `build-essential` and `g++`.
+
+### 2. Install CmdStanR & CmdStan Backend
+```r
+# Install cmdstanr from the Stan R-universe
+install.packages("cmdstanr", repos = c("[https://stan-dev.r-universe.dev](https://stan-dev.r-universe.dev)", getOption("repos")))
+
+# Verify toolchain and install CmdStan
+library(cmdstanr)
+check_cmdstan_toolchain()
+install_cmdstan(cores = 2)
 ```
 
-The meaning of `Amount` depends on the selected action.
-
-Examples:
-
-- nest protection: nests receiving protection;
-- headstarting: net additional turtles alive because of the intervention;
-- adult protection: adult deaths prevented.
-
-The interface collects the biological assumptions needed to translate those quantities into delayed ANE contributions.
-
----
-
-## Guided and developer views
-
-The default interface is designed for practitioners.
-
-It emphasizes:
-
-- plain-language questions;
-- progressively revealed inputs;
-- compact summaries;
-- scenario-based decision making;
-- minimal statistical jargon.
-
-A **Developer view** can be enabled for technical inspection.
-
-Developer outputs include additional information on:
-
-- posterior distributions;
-- convergence diagnostics;
-- process and observation variance;
-- model comparison;
-- retained posterior chains;
-- mathematical checks.
-
-The scientific engine is the same in both views. Developer view changes presentation, not the underlying calculations.
-
----
-
-## Mathematical validation
-
-The current methods-aligned implementation includes regression and identity checks covering:
-
-- projection-equation identity;
-- zero-Take equivalence;
-- Take-before-growth timing;
-- zero interactions;
-- zero mortality;
-- stochastic reproducibility;
-- first-nesting accounting;
-- ANE response to interaction number and mortality;
-- zero conservation action;
-- linear conservation-action scaling;
-- conservation timing;
-- emergence-success denominator equivalence;
-- adult Give/Take counterfactual symmetry;
-- Siders RI/4 abundance identity;
-- matched posterior \(U/Q\) rows.
-
-During development, the mathematical engine passed:
-
-```text
-565 external reference comparisons
-25 built-in mathematical checks
-```
-
-with a maximum reported reference difference of approximately:
-
-```math
-1.39 \times 10^{-17}
-```
-
-The guided workflow was additionally exercised using annual and monthly examples, JAGS/MARSS fitting, scenario creation, comparison, downloads, and mathematical diagnostics.
-
-These checks evaluate software implementation and mathematical consistency.
-
-They do **not** demonstrate that a particular set of biological parameters is appropriate for a particular population.
-
----
-
-## Important interpretation note
-
-This software should be described as **method-lineage aligned**, rather than as a literal reproduction of every historical Martin or Siders implementation.
-
-In particular, aggregate fishery ANE in the interactive framework uses the analytical expected value of the selected Siders first-nesting-only formulation.
-
-The application retains the corresponding:
-
-- growth model;
-- maturation structure;
-- survival calculation;
-- female probability;
-- remigration standardization;
-- Take timing;
-- dynamic paired \(U/Q\) projection structure.
-
-Conservation Give, user-facing scenario comparison, and selected uncertainty options are explicit extensions.
-
----
-
-## Installation
-
-The application requires R and JAGS.
-
-### R
-
-A recent version of R is recommended.
-
-### JAGS
-
-Install JAGS separately before running the application.
-
-JAGS is available from:
-
-https://mcmc-jags.sourceforge.io/
-
-### R packages
-
-Install the required packages in R:
-
+### 3. Install R Packages
 ```r
 install.packages(c(
-  "shiny",
-  "bslib",
-  "dplyr",
-  "tidyr",
-  "ggplot2",
-  "purrr",
-  "mvtnorm",
-  "truncnorm",
-  "jagsUI",
-  "MARSS",
-  "car"
+  "shiny", "bslib", "dplyr", "tidyr", 
+  "ggplot2", "purrr", "mvtnorm", "truncnorm", 
+  "posterior", "coda", "MARSS", "car"
 ))
 ```
 
 ---
 
-## Run the application
+## 🏃 Launching the Application
 
-Clone the repository:
-
-```bash
-git clone https://github.com/AnnaOrtega-NOAA/sea-turtle-population-toolkit.git
-```
-
-Move into the repository:
+Clone the repository and run the app from your local terminal or R console:
 
 ```bash
+git clone [https://github.com/AnnaOrtega-NOAA/sea-turtle-population-toolkit.git](https://github.com/AnnaOrtega-NOAA/sea-turtle-population-toolkit.git)
 cd sea-turtle-population-toolkit
 ```
 
-Then launch R and run:
-
+In R or RStudio:
 ```r
-shiny::runApp("app.R")
+shiny::runApp()
 ```
 
-Alternatively, open `app.R` in RStudio and click **Run App**.
+> [!TIP]
+> **First-Time Walkthrough:**  
+> 1. Launch the app and click **Load Synthetic Dataset**.  
+> 2. Step through the guided tabs: estimate trend, build an illustrative threat scenario and a conservation scenario, and run the comparative projection.  
+> 3. Toggle **Developer View** in the top navigation to inspect MCMC trace plots, posterior chains, and convergence diagnostics.
 
 ---
 
-## Recommended first run
+## 🔬 Computational & Mathematical Verification
 
-For a first run:
+The analytical engine has undergone extensive numerical validation:
 
-1. Launch the app.
-2. Choose the synthetic example dataset.
-3. Work through the guided interface.
-4. Estimate the population.
-5. Create one threat scenario.
-6. Create one conservation scenario.
-7. Save both scenarios.
-8. Compare them with status quo.
-9. Enable Developer view if you want to inspect diagnostics.
-
-Once the example workflow is familiar, repeat the process using your own nesting records and population-specific demographic parameters.
+* **Analytical Consistency:** Confirmed machine-precision numerical agreement against historical assessment implementations.
+* **Biological Symmetry:** Enforced structural conservation laws (e.g., preventing one adult mortality exactly offsets one adult lethal take; cohort nesting probabilities sum to 1.0).
+* **Monitoring Stress Tests:** Demonstrated that Bayesian trend estimation remains robust under up to 60% random monthly survey loss, while highlighting that multi-year monitoring gaps primarily degrade terminal abundance estimates.
 
 ---
 
-## Reproducibility
+## 📚 References
 
-For analytical or management use, retain:
+The analytical framework synthesizes NOAA Pacific Islands Fisheries Science Center assessments and recent methodological advancements:
 
-- the original monitoring CSV;
-- biological parameter values and their sources;
-- scenario schedules;
-- uncertainty assumptions;
-- downloaded run settings;
-- the software version or Git commit used for the analysis.
-
-For formal analyses, sufficiently large simulation and MCMC settings should be used to obtain stable estimates.
-
-Fast settings intended for interactive exploration should not automatically be treated as assessment-quality settings.
+* **Martin, S. L., Siders, Z., Eguchi, T., Langseth, B. J., Yau, A., Baker, J. D., Ahrens, R. N. M., & Jones, T. T. (2020a).** *Assessing the Population-level Impacts of North Pacific Loggerhead and Western Pacific Leatherback Turtle Interactions in the Hawaii-based Shallow-set Longline Fishery*. NOAA Technical Memorandum NMFS-PIFSC-95, 137 p. [doi:10.25923/ydp1-f891](https://doi.org/10.25923/ydp1-f891)
+* **Martin, S. L., Siders, Z., Eguchi, T., Langseth, B., Yau, A., Baker, J., Ahrens, R., & Jones, T. T. (2020b).** *Update to Assessing the Population-level Impacts of North Pacific Loggerhead and Western Pacific Leatherback Turtle Interactions: Inclusion of the Hawaii-based Deep-set and American Samoa-based Longline Fisheries*. NOAA Technical Memorandum NMFS-PIFSC-101, 67 p. [doi:10.25923/pnf2-2q77](https://doi.org/10.25923/pnf2-2q77)
+* **Siders, Z. A., Martin, S. L., Ahrens, R. N. M., & Jones, T. T. (2023).** *Update incorporating uncertainty in maturation and fishery takes into population-level impacts of western Pacific leatherback sea turtles*. PIFSC Internal Report IR-23-03, 29 p.
+* **Siders, Z. A., Martin, S. L., Ahrens, R. N. M., & Jones, T. T. (2025).** *Update to NOAA Technical Memorandum NMFS-PIFSC-101: Incorporating Uncertainty in Maturation and Recent Fishery Takes into the Population-Level Impacts of Western Pacific Leatherback Sea Turtles*. NOAA Technical Memorandum TM-PIFSC-184, 43 p. [doi:10.25923/72944](https://doi.org/10.25923/72944)
+* **Ortega, A. A., Siders, Z. A., Eguchi, T., Ahrens, R. N. M., Jones, T. T., & Martin, S. L. (In review).** *A common demographic currency for linking anthropogenic impacts to population status in sea turtles*. Conservation Biology.
 
 ---
 
-## Scope
+---
 
-The toolkit is intended to support transparent exploration of population-level consequences of threats and conservation actions.
+## ⚖️ License
 
-It is **not** intended to:
+Software authored by U.S. Government employees is in the public domain within the United States pursuant to 17 U.S.C. § 105. 
 
-- provide universal demographic parameters for sea turtle species;
-- replace population-specific biological review;
-- establish species-specific extinction thresholds;
-- determine regulatory significance automatically;
-- substitute for expert assessment or management review;
-- infer intervention cost-effectiveness.
-
-Outputs should be interpreted in the context of the monitoring data, demographic evidence, and assumptions supplied by the user.
+For international use and contributions authored by non-federal partners (e.g., University of Hawaiʻi / CIMAR), this project is distributed under the **MIT License** (or dedicated to the public domain via **CC0 1.0 Universal**). See [LICENSE.md](LICENSE.md) for full terms and the Department of Commerce copyright addendum.
 
 ---
 
-## Method lineage
+## 🏛️ NOAA & Department of Commerce Disclaimer
 
-The analytical framework builds on work including:
+This repository is a scientific product and is not an official communication of the National Oceanic and Atmospheric Administration (NOAA), the National Marine Fisheries Service (NMFS), or the United States Department of Commerce (DOC). 
 
-- Martin, S. L. et al. (2020). Population-level assessment methods for North Pacific loggerhead and western Pacific leatherback turtle interactions. NOAA Pacific Islands Fisheries Science Center.
-- Siders, Z. A. et al. (2023). Update incorporating uncertainty in maturation and fishery takes. PIFSC Internal Report IR-23-03.
-- Siders, Z. A., Martin, S. L., Ahrens, R. N. M., & Jones, T. T. (2025). Update incorporating uncertainty in maturation and recent fishery takes into population-level impacts of western Pacific leatherback sea turtles. NOAA Technical Memorandum TM-PIFSC-184.
+All NOAA GitHub project code is provided on an "as is" basis and the user assumes responsibility for its use. Any claims against the Department of Commerce or Department of Commerce bureaus stemming from the use of this GitHub project will be governed by all applicable Federal law. Any reference to specific commercial products, processes, or services by service mark, trademark, manufacturer, or otherwise, does not constitute or imply their endorsement, recommendation, or favoring by the Department of Commerce. The Department of Commerce seal and logo, or the seal and logo of a DOC bureau, shall not be used in any manner to imply endorsement of any commercial product or activity by DOC or the United States Government.
 
-Please consult the associated reports and manuscripts for methodological detail and appropriate interpretation.
-
----
-
-## Citation
-
-If you use this toolkit in research, assessment, or management work, please cite the software version used.
-
-Citation information is provided in:
-
-```text
-CITATION.cff
-```
-
-A manuscript describing the generalized common-currency framework and conservation extensions is in development.
-
----
-
-## Development status
-
-**Current release stage: early public release / technical review**
-
-The core mathematical engine has undergone extensive implementation testing, but the software remains under active development.
-
-Feedback is particularly useful on:
-
-- usability for conservation practitioners;
-- population-specific parameter requirements;
-- monitoring-data edge cases;
-- diagnostic presentation;
-- threat and conservation scenario definitions;
-- reproducibility and reporting outputs.
-
----
-
-## Contributing
-
-Issues and suggestions are welcome.
-
-When reporting a problem, please include:
-
-- the software version or Git commit;
-- the stage of the workflow where the problem occurred;
-- the relevant error message;
-- a minimal reproducible example when possible.
-
-Do not upload sensitive or restricted monitoring data to a public GitHub issue.
-
----
-
-## License
-
-A software license has not yet been assigned.
-
-Please check the repository before reuse or redistribution, as licensing information may change before the first formal release.
-
----
-
-## Disclaimer
-
-This software is a scientific decision-support and research tool.
-
-Outputs depend on the quality and appropriateness of the monitoring data, biological parameters, model assumptions, and scenarios supplied by the user.
-
-The toolkit does not independently validate population-specific demographic assumptions or determine management decisions.
+The scientific results, models, and conclusions presented in this software are intended to support decision analysis and do not represent formal regulatory determinations, Endangered Species Act (ESA) biological opinions, or official agency policy.
